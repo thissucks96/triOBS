@@ -9,6 +9,11 @@
     <Nullable>disable</Nullable>
     <InvariantGlobalization>true</InvariantGlobalization>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <ApplicationIcon>trirec.ico</ApplicationIcon>
+    <!-- dotnet publish TriRecTray -c Release -o app  gives one TriRecTray.exe (needs the .NET 8 Desktop Runtime) -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\TriRec\Core.cs" Link="Core.cs" />

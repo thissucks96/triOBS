@@ -213,7 +213,8 @@ static class Tray
         using var mutex = new Mutex(true, MutexName, out bool first);
         if (!first)
         {
-            MessageBox.Show("TriRec is already running. Look for its dot in the system tray.", "TriRec");
+            // Already running (e.g. the taskbar pin was clicked): bring up its settings window instead.
+            if (!Signal(SettingsEventName)) MessageBox.Show("TriRec is already running. Look for its dot in the system tray.", "TriRec");
             return;
         }
 
@@ -359,7 +360,7 @@ static class Tray
     static void ShowSettings()
     {
         if (form != null) { form.Activate(); return; }
-        form = new SettingsForm(settings, AutoStart.Enabled, red);
+        form = new SettingsForm(settings, AutoStart.Enabled, AppIcon());
         form.FormClosed += (_, _) =>
         {
             var f = form;
@@ -411,6 +412,12 @@ static class Tray
             if (f.Saved) Persist(f);
         }
         else f.Close();
+    }
+
+    // The exe's own icon (trirec.ico), so the settings window matches the taskbar pin.
+    static Icon AppIcon()
+    {
+        try { return Icon.ExtractAssociatedIcon(Environment.ProcessPath) ?? red; } catch { return red; }
     }
 
     static Icon Dot(Color c)

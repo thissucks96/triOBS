@@ -53,6 +53,13 @@ Open, not fixed (each is new behaviour, the owner decides):
 - While stopped, saving settings does not start recording; no automatic restarts.
 - Launching the app (and Start with Windows) still starts recording straight away.
 
+## One exe, own icon, taskbar pin (2026-11-17)
+- `dotnet publish TriRecTray -c Release -o app` gives a single `app\TriRecTray.exe` (needs .NET 8 Desktop Runtime).
+- Icon: `TriRecTray\trirec.ico`, drawn by `tools\make-icon.ps1`.
+- Opening it while it runs (e.g. clicking the taskbar pin) opens the settings window of the running copy.
+  Tested: one copy stays, settings window appears, no message box.
+- Start menu shortcut `TriRec` added (%APPDATA%\Microsoft\Windows\Start Menu\Programs\TriRec.lnk).
+
 ## 3. Never tested
 - Clicking the tray menu and how the icon looks (stop/start/exit were tested with the switches).
 - Saving settings while recording is stopped.
