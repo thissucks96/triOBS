@@ -1,12 +1,15 @@
 // TriRecTray.exe: the recorder as a system tray app, with no main window.
 //
-// Starting it starts recording. "Stop recording and exit" in the tray menu
-// closes the current file properly and quits; quitting is the only way to stop.
-// "Settings..." edits %APPDATA%\TriRec\settings.json; saving restarts the recording.
+// Starting it starts recording. "Stop recording" in the tray menu closes the current file
+// properly and keeps the app in the tray (gray dot); "Start recording" begins a new file.
+// "Exit" stops recording and quits.
+// "Settings..." edits %APPDATA%\TriRec\settings.json; saving restarts the recording if one is running.
 //
-//   TriRecTray [--out DIR]   record (settings come from the settings file; --out overrides the folder for this run)
-//   TriRecTray --stop        ask the running tray app to stop and exit (same as the menu item)
-//   TriRecTray --settings    ask the running tray app to open its settings window
+//   TriRecTray [--out DIR]       record (settings come from the settings file; --out overrides the folder for this run)
+//   TriRecTray --stop-recording  ask the running tray app to stop recording and stay in the tray
+//   TriRecTray --start-recording ask the running tray app to start recording
+//   TriRecTray --exit            ask the running tray app to stop and exit (--stop is the old name)
+//   TriRecTray --settings        ask the running tray app to open its settings window
 //
 // Messages go to trirec.log in the recordings folder.
 using System.Diagnostics;
@@ -158,7 +161,7 @@ sealed class SettingsForm : Form
         Row("Windows", auto);
         var buttons = Flow(SaveButton, cancel);
         buttons.Anchor = AnchorStyles.Right; buttons.Margin = new Padding(3, 14, 3, 0);
-        grid.Controls.Add(Hint("Saving restarts the recording; a new file begins."));
+        grid.Controls.Add(Hint("Saving restarts the recording (if one is running); a new file begins."));
         grid.SetColumnSpan(grid.Controls[^1], 2);
         grid.Controls.Add(buttons);
         grid.SetColumnSpan(buttons, 2);
@@ -174,12 +177,14 @@ sealed class SettingsForm : Form
 
 static class Tray
 {
-    const string StopEventName = "TriRecTray.Stop", SettingsEventName = "TriRecTray.Settings", MutexName = "TriRecTray.SingleInstance";
+    const string StopEventName = "TriRecTray.Stop", SettingsEventName = "TriRecTray.Settings", MutexName = "TriRecTray.SingleInstance",
+                 PauseEventName = "TriRecTray.StopRecording", ResumeEventName = "TriRecTray.StartRecording";
 
     static Settings settings;
     static Options opts;
     static string outOverride;
     static Session session;
+    static bool paused;    // the owner stopped recording; the app stays in the tray
     static bool died;      // the recorder ended by itself and a restart is pending
     static int failures;   // restarts in a row that did not last
     static long retryAt;
@@ -191,7 +196,9 @@ static class Tray
     [STAThread]
     static void Main(string[] args)
     {
-        if (args.Contains("--stop")) { Signal(StopEventName); return; }
+        if (args.Contains("--exit") || args.Contains("--stop")) { Signal(StopEventName); return; }
+        if (args.Contains("--stop-recording")) { Signal(PauseEventName); return; }
+        if (args.Contains("--start-recording")) { Signal(ResumeEventName); return; }
         if (args.Contains("--settings") && Signal(SettingsEventName)) return;
         // Same as ticking or clearing "Start with Windows" in Settings, without opening the window.
         if (args.Contains("--startup-on")) { AutoStart.Set(true); return; }
@@ -220,16 +227,20 @@ static class Tray
 
         using var stopEvent = new EventWaitHandle(false, EventResetMode.AutoReset, StopEventName);
         using var settingsEvent = new EventWaitHandle(false, EventResetMode.AutoReset, SettingsEventName);
+        using var pauseEvent = new EventWaitHandle(false, EventResetMode.AutoReset, PauseEventName);
+        using var resumeEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ResumeEventName);
         icon = new NotifyIcon { Icon = gray, Text = "TriRec", Visible = true };
 
         var menu = new ContextMenuStrip();
         var status = menu.Items.Add("Recording");
         status.Enabled = false;
+        var toggle = menu.Items.Add("Stop recording", null, (_, _) => { if (paused) Resume(); else Pause(); });
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open recordings folder", null, (_, _) => Process.Start(new ProcessStartInfo(opts.OutDir) { UseShellExecute = true })); // works for folder names with spaces or commas
         menu.Items.Add("Settings...", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Stop recording and exit", null, (_, _) => Application.Exit());
-        menu.Opening += (_, _) => status.Text = State();
+        menu.Items.Add("Exit", null, (_, _) => Application.Exit());
+        menu.Opening += (_, _) => { status.Text = State(); toggle.Text = paused ? "Start recording" : "Stop recording"; };
         icon.ContextMenuStrip = menu;
         icon.DoubleClick += (_, _) => ShowSettings();
 
@@ -242,6 +253,8 @@ static class Tray
         {
             if (stopEvent.WaitOne(0)) { Application.Exit(); return; }
             if (settingsEvent.WaitOne(0)) ShowSettings();
+            if (pauseEvent.WaitOne(0) && !paused) Pause();
+            if (resumeEvent.WaitOne(0) && paused) Resume();
             if (session != null && !died && session.Ff.HasExited)
             {
                 // The recorder ended by itself: start it again, waiting longer each time it keeps failing
@@ -276,8 +289,28 @@ static class Tray
         icon.Dispose();
     }
 
+    // Stop recording but stay in the tray, like OBS. Also cancels a pending automatic restart.
+    static void Pause()
+    {
+        Cursor.Current = Cursors.WaitCursor;
+        paused = true;
+        if (died) { session?.Stop(0); session = null; died = false; } // already exited; release the sound devices
+        else StopRecording();
+        icon.Icon = gray;
+        Recorder.Log("recording stopped from the tray; app still running");
+        Cursor.Current = Cursors.Default;
+    }
+
+    static void Resume()
+    {
+        paused = false;
+        if (StartRecording()) Recorder.Log("recording started from the tray");
+        else paused = true; // could not start (message already shown): stay stopped, no automatic retries
+    }
+
     static string State()
     {
+        if (paused) return "Stopped (right-click, Start recording)";
         if (died) return "Recording stopped; starting again shortly";
         if (session == null) return "Not recording (check Settings)";
         var t = session.Wall.Elapsed;
@@ -333,6 +366,7 @@ static class Tray
             form = null;
             if (!f.Saved) return;
             settings = Persist(f);
+            if (paused) { opts = settings.ToOptions(outOverride); return; } // stopped: keep it stopped, use the new settings next time
             Cursor.Current = Cursors.WaitCursor;
             StopRecording();
             StartRecording();

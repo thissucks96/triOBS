@@ -46,8 +46,16 @@ Open, not fixed (each is new behaviour, the owner decides):
   Seen peaking at -0.3 dB in the first live minute.
 - `test\sync-test.ps1` measures track 1, which is now the Mix (the beep is in it).
 
+## Stop without exiting (2026-11-17)
+- Tray menu: "Stop recording" / "Start recording" (app stays in the tray, gray dot), "Exit".
+  Switches for scripts: `--stop-recording`, `--start-recording`, `--exit` (`--stop` still exits).
+- Test: `test\pause-test.ps1` (stop, start, exit; two complete files). Passed 10/10.
+- While stopped, saving settings does not start recording; no automatic restarts.
+- Launching the app (and Start with Windows) still starts recording straight away.
+
 ## 3. Never tested
-- Clicking the tray menu and how the icon looks (stop was tested with `--stop`).
+- Clicking the tray menu and how the icon looks (stop/start/exit were tested with the switches).
+- Saving settings while recording is stopped.
 - Stop on Windows sign-out, second-launch message.
 - Ctrl+C in the console version.
 - Sync after the 2026-11-16 04:30 audio changes (not re-measured; the timing rule is unchanged).
