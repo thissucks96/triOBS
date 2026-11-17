@@ -60,6 +60,20 @@ Open, not fixed (each is new behaviour, the owner decides):
   Tested: one copy stays, settings window appears, no message box.
 - Start menu shortcut `TriRec` added (%APPDATA%\Microsoft\Windows\Start Menu\Programs\TriRec.lnk).
 
+## Sync, limiter, device switch, marks (2026-11-17)
+- Sync: the offset depends on frame rate. Measured with no correction (positive = sound late):
+  10 fps -0.03 s, 15 fps +0.10 s, 23 fps +0.20 s, 30 fps +0.20 s (6-10 events each, while the PC was idle).
+  `Options.AutoShift` undoes it (23 fps: sound 200 ms earlier); in between is interpolated.
+  Override: `AudioShiftMs` in settings.json, `--audio-shift` on the console.
+  NOT confirmed after the change: the check runs were spoiled by Chrome on the main monitor (flashes missing
+  or late). Re-run on an idle screen: `test\sync-test.ps1 -Fps 23 -Events 10`.
+- Mix limiter (alimiter, -1 dB). Offline test: loud input 0.0 dB (clipped) -> -1.0 dB; normal level unchanged.
+- Sound format: Windows is asked for 48 kHz float (System stereo, Mic mono) and converts. Every 2 s the default
+  device is checked; a change is followed. Tested with forced 44.1 kHz and a pretended switch (beeps intact
+  before and after). A real switch of the default device was NOT tested.
+- Ctrl+Alt+M / menu "Mark this moment" / `--mark`: appends "hh:mm:ss (clock)" to `<file>.marks.txt`.
+  Tested with the switch and a real keypress.
+
 ## 3. Never tested
 - Clicking the tray menu and how the icon looks (stop/start/exit were tested with the switches).
 - Saving settings while recording is stopped.

@@ -10,11 +10,13 @@
 //   TriRecTray --start-recording ask the running tray app to start recording
 //   TriRecTray --exit            ask the running tray app to stop and exit (--stop is the old name)
 //   TriRecTray --settings        ask the running tray app to open its settings window
+//   TriRecTray --mark            mark this moment (same as Ctrl+Alt+M): appends to <file>.marks.txt
 //
 // Messages go to trirec.log in the recordings folder.
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.Win32;
 
@@ -28,6 +30,8 @@ sealed class Settings
     public int SegmentMinutes { get; set; } = 10;
     public bool SystemAudio { get; set; } = true;
     public bool Mic { get; set; } = true;
+    // Sound moved this many ms later (negative = earlier). Leave out (null) for the measured automatic value.
+    public int? AudioShiftMs { get; set; }
 
     // TRIREC_SETTINGS lets a test use its own file instead of the real one.
     public static string FilePath => Environment.GetEnvironmentVariable("TRIREC_SETTINGS")
@@ -47,7 +51,7 @@ sealed class Settings
     }
 
     public Options ToOptions(string outOverride) => new(Fps, Qp, 20, SegmentMinutes * 60, 0,
-        Path.GetFullPath(outOverride ?? OutDir), SystemAudio, Mic, Hidden: true);
+        Path.GetFullPath(outOverride ?? OutDir), SystemAudio, Mic, Hidden: true, AudioShiftMs);
 }
 
 // "Start with Windows" = TriRec.lnk in the current user's Startup folder, pointing at this exe.
@@ -175,10 +179,40 @@ sealed class SettingsForm : Form
     };
 }
 
+// Global hotkey Ctrl+Alt+M (works while a game has focus). Ok is false if another program already owns it.
+sealed class Hotkey : NativeWindow, IDisposable
+{
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    const uint MOD_ALT = 1, MOD_CONTROL = 2, MOD_NOREPEAT = 0x4000;
+    readonly Action pressed;
+    public readonly bool Ok;
+
+    public Hotkey(Action pressed)
+    {
+        this.pressed = pressed;
+        CreateHandle(new CreateParams());
+        Ok = RegisterHotKey(Handle, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, (uint)Keys.M);
+        if (!Ok) Recorder.Log("Ctrl+Alt+M is taken by another program; use the tray menu to mark moments");
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == 0x0312 && m.WParam == (IntPtr)1) pressed(); // WM_HOTKEY
+        base.WndProc(ref m);
+    }
+
+    public void Dispose()
+    {
+        if (Ok) UnregisterHotKey(Handle, 1);
+        DestroyHandle();
+    }
+}
+
 static class Tray
 {
     const string StopEventName = "TriRecTray.Stop", SettingsEventName = "TriRecTray.Settings", MutexName = "TriRecTray.SingleInstance",
-                 PauseEventName = "TriRecTray.StopRecording", ResumeEventName = "TriRecTray.StartRecording";
+                 PauseEventName = "TriRecTray.StopRecording", ResumeEventName = "TriRecTray.StartRecording", MarkEventName = "TriRecTray.Mark";
 
     static Settings settings;
     static Options opts;
@@ -199,6 +233,7 @@ static class Tray
         if (args.Contains("--exit") || args.Contains("--stop")) { Signal(StopEventName); return; }
         if (args.Contains("--stop-recording")) { Signal(PauseEventName); return; }
         if (args.Contains("--start-recording")) { Signal(ResumeEventName); return; }
+        if (args.Contains("--mark")) { Signal(MarkEventName); return; }
         if (args.Contains("--settings") && Signal(SettingsEventName)) return;
         // Same as ticking or clearing "Start with Windows" in Settings, without opening the window.
         if (args.Contains("--startup-on")) { AutoStart.Set(true); return; }
@@ -230,12 +265,15 @@ static class Tray
         using var settingsEvent = new EventWaitHandle(false, EventResetMode.AutoReset, SettingsEventName);
         using var pauseEvent = new EventWaitHandle(false, EventResetMode.AutoReset, PauseEventName);
         using var resumeEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ResumeEventName);
+        using var markEvent = new EventWaitHandle(false, EventResetMode.AutoReset, MarkEventName);
+        using var hotkey = new Hotkey(Mark);
         icon = new NotifyIcon { Icon = gray, Text = "TriRec", Visible = true };
 
         var menu = new ContextMenuStrip();
         var status = menu.Items.Add("Recording");
         status.Enabled = false;
         var toggle = menu.Items.Add("Stop recording", null, (_, _) => { if (paused) Resume(); else Pause(); });
+        menu.Items.Add(hotkey.Ok ? "Mark this moment (Ctrl+Alt+M)" : "Mark this moment", null, (_, _) => Mark());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open recordings folder", null, (_, _) => Process.Start(new ProcessStartInfo(opts.OutDir) { UseShellExecute = true })); // works for folder names with spaces or commas
         menu.Items.Add("Settings...", null, (_, _) => ShowSettings());
@@ -256,6 +294,7 @@ static class Tray
             if (settingsEvent.WaitOne(0)) ShowSettings();
             if (pauseEvent.WaitOne(0) && !paused) Pause();
             if (resumeEvent.WaitOne(0) && paused) Resume();
+            if (markEvent.WaitOne(0)) Mark();
             if (session != null && !died && session.Ff.HasExited)
             {
                 // The recorder ended by itself: start it again, waiting longer each time it keeps failing
@@ -288,6 +327,30 @@ static class Tray
         icon.Visible = false;
         StopRecording();
         icon.Dispose();
+    }
+
+    // Ctrl+Alt+M or the menu: note the time in the file being recorded, in "<file>.marks.txt" next to it,
+    // so a moment can be found later without scrubbing. Times are from the file name (its start), about ±1 s.
+    static void Mark()
+    {
+        if (session == null || paused || died) { icon.ShowBalloonTip(2000, "TriRec", "Not recording; nothing marked.", ToolTipIcon.None); return; }
+        var now = DateTime.Now;
+        var file = new DirectoryInfo(opts.OutDir).GetFiles("*.mkv")
+            .Where(f => f.LastWriteTime >= session.Started.AddSeconds(-5))
+            .OrderByDescending(f => f.Name).FirstOrDefault();
+        if (file == null || !DateTime.TryParseExact(Path.GetFileNameWithoutExtension(file.Name), "yyyy-MM-dd_HH-mm-ss",
+                null, System.Globalization.DateTimeStyles.None, out var start))
+        {
+            Recorder.Log("mark: no file being recorded was found");
+            return;
+        }
+        var at = now - start;
+        if (at < TimeSpan.Zero) at = TimeSpan.Zero;
+        string marks = Path.ChangeExtension(file.FullName, ".marks.txt");
+        try { File.AppendAllText(marks, $"{(int)at.TotalHours:00}:{at:mm\\:ss}  (clock {now:HH:mm:ss}){Environment.NewLine}"); }
+        catch (Exception e) { Recorder.Log("mark: could not write " + marks + ": " + e.Message); return; }
+        Recorder.Log($"mark at {at:hh\\:mm\\:ss} in {file.Name}");
+        icon.ShowBalloonTip(2000, "TriRec", $"Marked {(int)at.TotalHours:00}:{at:mm\\:ss} in {file.Name}", ToolTipIcon.None);
     }
 
     // Stop recording but stay in the tray, like OBS. Also cancels a pending automatic restart.

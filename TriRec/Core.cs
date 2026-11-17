@@ -14,12 +14,29 @@ namespace TriRec;
 
 record Mon(int Idx, int W, int H, int X, int Y);
 
-record Options(int Fps, int Qp, int Gop, int Segment, int Seconds, string OutDir, bool Audio, bool Mic, bool Hidden)
+// AudioShiftMs: all sound is moved this much later (negative = earlier) against the picture. null = AutoShift(fps).
+record Options(int Fps, int Qp, int Gop, int Segment, int Seconds, string OutDir, bool Audio, bool Mic, bool Hidden,
+               int? AudioShiftMs = null)
 {
+    public int Shift => AudioShiftMs ?? AutoShift(Fps);
+
+    // Measured 2026-11-17 with test\sync-test.ps1 (sound vs picture with no shift): 10 fps -0.03 s, 15 fps +0.10 s,
+    // 23 fps +0.20 s, 30 fps +0.20 s (positive = sound late). The shift undoes that, straight lines in between.
+    // Other frame rates are interpolated, not measured.
+    public static int AutoShift(int fps)
+    {
+        (int f, int ms)[] p = { (10, 30), (15, -100), (23, -200), (30, -200) };
+        if (fps <= p[0].f) return p[0].ms;
+        for (int i = 1; i < p.Length; i++)
+            if (fps <= p[i].f) return p[i - 1].ms + (p[i].ms - p[i - 1].ms) * (fps - p[i - 1].f) / (p[i].f - p[i - 1].f);
+        return p[^1].ms;
+    }
+
     public static Options Parse(string[] args, string defaultOut, bool hidden) => new(
         Int(args, "--fps", 10), Int(args, "--qp", 26), Int(args, "--gop", 20), Int(args, "--segment", 600),
         Int(args, "--seconds", 0), Path.GetFullPath(Str(args, "--out", defaultOut)),
-        !args.Contains("--no-audio"), !args.Contains("--no-audio") && !args.Contains("--no-mic"), hidden);
+        !args.Contains("--no-audio"), !args.Contains("--no-audio") && !args.Contains("--no-mic"), hidden,
+        args.Contains("--audio-shift") ? Int(args, "--audio-shift", 0) : null);
 
     public static string Str(string[] args, string name, string def)
     {
@@ -40,6 +57,8 @@ sealed class Session
     internal CancellationTokenSource Cts = new();
     // Stopwatch timestamp of the moment ffmpeg captured its first video frames (0 = not known yet).
     internal long VideoStart;
+    // Sync correction in Stopwatch ticks: the audio timeline starts this much before VideoStart (negative = after).
+    internal long ShiftTicks;
 
     // Ask ffmpeg to finish the current file properly ("q" on its stdin).
     public void RequestStop()
@@ -70,7 +89,7 @@ static class Recorder
     {
         Directory.CreateDirectory(o.OutDir);
         var (mons, cw, ch) = Layout(Probe());
-        Log($"Canvas {cw}x{ch}, {o.Fps} fps, HEVC qp {o.Qp}");
+        Log($"Canvas {cw}x{ch}, {o.Fps} fps, HEVC qp {o.Qp}, sound shifted {o.Shift:+0;-0} ms{(o.AudioShiftMs == null ? " (auto)" : "")}");
         for (int i = 0; i < mons.Count; i++)
             Log($"  monitor {i + 1}: {mons[i].W}x{mons[i].H} at ({mons[i].X},{mons[i].Y})");
 
@@ -113,20 +132,23 @@ static class Recorder
         int si = taps.FindIndex(t => t.Title == "System"), mi = taps.FindIndex(t => t.Title == "Mic");
         bool mix = si >= 0 && mi >= 0;
         const string Mono = "aresample=48000,aformat=sample_rates=48000:channel_layouts=mono";
+        string In(int i) => $"[{i}:a]";
         if (si >= 0)
         {
-            if (mix) audio.Add($"[{si}:a]asplit=2[sys][sysmix]");
-            tracks.Add((mix ? "[sys]" : $"{si}:a", "System", 2));
+            audio.Add(In(si) + (mix ? "asplit=2[sys][sysmix]" : "anull[sys]"));
+            tracks.Add(("[sys]", "System", 2));
         }
         if (mi >= 0)
         {
-            audio.Add($"[{mi}:a]{Mono}" + (mix ? ",asplit=2[mic][micmix]" : "[mic]"));
+            audio.Add(In(mi) + Mono + (mix ? ",asplit=2[mic][micmix]" : "[mic]"));
             tracks.Add(("[mic]", "Mic", 1));
         }
         if (mix)
         {
-            // normalize=0 keeps both at full level instead of halving each
-            audio.Add($"[sysmix]{Mono}[sysmono];[sysmono][micmix]amix=inputs=2:duration=longest:normalize=0[mix]");
+            // normalize=0 keeps both at full level instead of halving each; the limiter then keeps loud moments
+            // (game sound plus speech) under -1 dB instead of clipping. level=0: no automatic gain, latency=1: no delay.
+            audio.Add($"[sysmix]{Mono}[sysmono];[sysmono][micmix]amix=inputs=2:duration=longest:normalize=0," +
+                      "alimiter=limit=0.891:attack=5:release=50:level=0:latency=1[mix]");
             tracks.Insert(0, ("[mix]", "Mix", 1)); // first track, and the one players pick by default
         }
         a.Add("-filter_complex"); a.Add(string.Join(";", new[] { grab, stack }.Concat(audio)));
@@ -147,7 +169,7 @@ static class Recorder
                      "-reset_timestamps", "1", "-strftime", "1",
                      Path.Combine(o.OutDir, "%Y-%m-%d_%H-%M-%S.mkv") }) a.Add(s);
 
-        var session = new Session { OutDir = o.OutDir, Started = DateTime.Now };
+        var session = new Session { OutDir = o.OutDir, Started = DateTime.Now, ShiftTicks = o.Shift * Stopwatch.Frequency / 1000 };
         try { session.Ff = Process.Start(psi); }
         catch { foreach (var t in taps) t.Close(); throw; } // ffmpeg missing: free the devices and pipes
         foreach (var t in taps) new Thread(() => t.Run(session.Cts.Token, session)) { IsBackground = true }.Start();
@@ -271,11 +293,19 @@ sealed class AudioTap
     IAudioClient client;
     IAudioCaptureClient cap;
     readonly NamedPipeServerStream pipe;
+    byte[] format;    // the WAVEFORMATEX this recording uses; every device after the first is asked for it too
+    string deviceId;  // the device being captured, to notice when the Windows default changes
+
+    const int Loopback = 0x00020000, AutoConvert = unchecked((int)0x80000000) | 0x08000000; // AUTOCONVERTPCM | SRC_DEFAULT_QUALITY
+    // Test hooks: TRIREC_TEST_RATE asks for another rate (proves Windows' conversion), TRIREC_TEST_SWITCH_SEC
+    // acts as if the default device changed that many seconds in.
+    static readonly int TestRate = int.TryParse(Environment.GetEnvironmentVariable("TRIREC_TEST_RATE"), out int r) ? r : 48000;
+    static readonly int TestSwitchSec = int.TryParse(Environment.GetEnvironmentVariable("TRIREC_TEST_SWITCH_SEC"), out int s) ? s : 0;
 
     public AudioTap(bool loopback, string title, string pipeName)
     {
         this.loopback = loopback; Title = title; PipeName = pipeName;
-        Open(out Rate, out Channels, out Fmt, out blockAlign);
+        Open(first: true);
         // ~100 ms of pipe buffer: small, so little stale audio sits in it while ffmpeg starts up
         pipe = new NamedPipeServerStream(pipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous, 0, Rate * blockAlign / 10); // asynchronous so waiting for ffmpeg can be cancelled
@@ -289,46 +319,105 @@ sealed class AudioTap
         try { pipe.Dispose(); } catch { }
     }
 
-    void Open(out int rate, out int channels, out string fmt, out int align)
+    // Open the current default device. The first time, ask Windows for a fixed format (48 kHz float; stereo
+    // for system sound, mono for the mic) and let it convert, so a later default device with another rate or
+    // channel count still fits this recording. If a device refuses that, fall back to its own format.
+    void Open(bool first)
     {
-        var en = (IMMDeviceEnumerator)new MMDeviceEnumerator();
-        en.GetDefaultAudioEndpoint(loopback ? 0 : 1, 0, out var dev);
-        var iid = typeof(IAudioClient).GUID;
-        dev.Activate(ref iid, 23, IntPtr.Zero, out var o);
-        var c = (IAudioClient)o;
-        c.GetMixFormat(out IntPtr wf);
-        try
+        var dev = DefaultDevice(out string id);
+        int flags = loopback ? Loopback : 0;
+        IAudioClient c;
+        if (first)
         {
-            int tag = (ushort)Marshal.ReadInt16(wf, 0), bits = Marshal.ReadInt16(wf, 14);
-            channels = Marshal.ReadInt16(wf, 2);
-            rate = Marshal.ReadInt32(wf, 4);
-            align = Marshal.ReadInt16(wf, 12);
-            bool isFloat = tag == 3 || (tag == 0xFFFE && Marshal.ReadInt32(wf, 24) == 3);
-            fmt = isFloat ? "f32le" : bits switch { 16 => "s16le", 24 => "s24le", 32 => "s32le", _ => throw new Exception($"unsupported {bits}-bit audio") };
-            c.Initialize(0, loopback ? 0x00020000 : 0, 10_000_000, 0, wf, IntPtr.Zero); // shared mode, 1 s buffer
+            format = Wave(TestRate, loopback ? 2 : 1);
+            c = Activate(dev);
+            if (!TryInit(c, flags | AutoConvert, format))
+            {
+                c = Activate(dev); // a client whose Initialize failed cannot be used again
+                c.GetMixFormat(out IntPtr wf);
+                try { format = Copy(wf); } finally { Marshal.FreeCoTaskMem(wf); }
+                Init(c, flags, format);
+                Recorder.Log($"  audio {Title}: device refused the fixed format; using its own (a later device switch only works if the format matches)");
+            }
+            int tag = BitConverter.ToUInt16(format, 0), bits = BitConverter.ToInt16(format, 14);
+            Channels = BitConverter.ToInt16(format, 2);
+            Rate = BitConverter.ToInt32(format, 4);
+            blockAlign = BitConverter.ToInt16(format, 12);
+            bool isFloat = tag == 3 || (tag == 0xFFFE && BitConverter.ToInt32(format, 24) == 3);
+            Fmt = isFloat ? "f32le" : bits switch { 16 => "s16le", 24 => "s24le", 32 => "s32le", _ => throw new Exception($"unsupported {bits}-bit audio") };
         }
-        finally { Marshal.FreeCoTaskMem(wf); }
+        else
+        {
+            c = Activate(dev);
+            Init(c, flags | AutoConvert, format);
+        }
         var iidCap = typeof(IAudioCaptureClient).GUID;
         c.GetService(ref iidCap, out var co);
         c.Start();
-        client = c; cap = (IAudioCaptureClient)co;
+        client = c; cap = (IAudioCaptureClient)co; deviceId = id;
     }
 
-    // Try to follow a changed/reconnected default device; only usable if its format matches.
-    void Reopen()
+    IMMDevice DefaultDevice(out string id)
     {
-        try
-        {
-            Open(out int r, out int ch, out string f, out _);
-            if (r != Rate || ch != Channels || f != Fmt)
-            {
-                try { client.Stop(); } catch { }
-                cap = null; client = null;
-                Note($"new default device is {r} Hz {ch} ch {f}, not the {Rate} Hz {Channels} ch {Fmt} this recording started with; track stays silent");
-            }
-            else Note("device reconnected, capturing again");
-        }
-        catch (Exception e) { cap = null; client = null; Note("still no device (" + e.Message + ")"); }
+        var en = (IMMDeviceEnumerator)new MMDeviceEnumerator(); // a fresh one on the calling thread
+        en.GetDefaultAudioEndpoint(loopback ? 0 : 1, 0, out var dev);
+        dev.GetId(out IntPtr p);
+        try { id = Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+        return dev;
+    }
+
+    static IAudioClient Activate(IMMDevice dev)
+    {
+        var iid = typeof(IAudioClient).GUID;
+        dev.Activate(ref iid, 23, IntPtr.Zero, out var o);
+        return (IAudioClient)o;
+    }
+
+    static void Init(IAudioClient c, int flags, byte[] wf)
+    {
+        IntPtr p = Marshal.AllocHGlobal(wf.Length);
+        try { Marshal.Copy(wf, 0, p, wf.Length); c.Initialize(0, flags, 10_000_000, 0, p, IntPtr.Zero); } // shared mode, 1 s buffer
+        finally { Marshal.FreeHGlobal(p); }
+    }
+
+    static bool TryInit(IAudioClient c, int flags, byte[] wf)
+    {
+        try { Init(c, flags, wf); return true; } catch (COMException) { return false; }
+    }
+
+    static byte[] Copy(IntPtr wf)
+    {
+        int tag = (ushort)Marshal.ReadInt16(wf, 0);
+        var b = new byte[tag == 1 ? 18 : 18 + Marshal.ReadInt16(wf, 16)]; // plain PCM has no cbSize field
+        Marshal.Copy(wf, b, 0, tag == 1 ? 16 : b.Length);
+        return b;
+    }
+
+    // WAVEFORMATEXTENSIBLE, 32-bit float.
+    static byte[] Wave(int rate, int channels)
+    {
+        var b = new byte[40];
+        void W16(int at, int v) => BitConverter.GetBytes((short)v).CopyTo(b, at);
+        void W32(int at, int v) => BitConverter.GetBytes(v).CopyTo(b, at);
+        W16(0, 0xFFFE); W16(2, channels); W32(4, rate); W32(8, rate * channels * 4); W16(12, channels * 4); W16(14, 32);
+        W16(16, 22); W16(18, 32); W32(20, channels == 1 ? 4 : 3); // mono = centre, stereo = left|right
+        new Guid("00000003-0000-0010-8000-00aa00389b71").ToByteArray().CopyTo(b, 24); // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        return b;
+    }
+
+    // Switch to the current default device (after it changed or the old one was lost).
+    void Reopen(string why)
+    {
+        try { client?.Stop(); } catch { }
+        cap = null; client = null;
+        try { Open(first: false); Note(why + ", capturing from the default device"); }
+        catch (Exception e) { Note("no usable device yet, writing silence (" + e.Message + ")"); }
+    }
+
+    bool DefaultChanged()
+    {
+        try { DefaultDevice(out string id); return id != deviceId; }
+        catch { return true; } // no default device at all: Reopen will say so
     }
 
     string lastNote;
@@ -368,7 +457,8 @@ sealed class AudioTap
             // The audio timeline is the wall clock since the anchor. Every frame produced is
             // counted against it: silence is added when the device delivers nothing (loopback is silent
             // when nothing plays), and packets are skipped if the device runs fast.
-            long produced = 0, nextReopen = 0;
+            long produced = 0, nextReopen = 0, nextCheck = 0;
+            long testSwitchAt = TestSwitchSec > 0 ? Environment.TickCount64 + TestSwitchSec * 1000L : long.MaxValue;
             long Expected() => (long)((Stopwatch.GetTimestamp() - anchor) * (double)Rate / Stopwatch.Frequency);
             int chunk = Rate / 50; // 20 ms of frames
             byte[] zeros = new byte[chunk * blockAlign];
@@ -386,7 +476,9 @@ sealed class AudioTap
                 long vs;
                 if (!aligned && (vs = Volatile.Read(ref session.VideoStart)) != 0)
                 {
-                    aligned = true; anchor = vs;
+                    // Shifted for sync: an earlier anchor puts sound later (silence is added), a later one
+                    // puts it earlier (the extra audio is skipped).
+                    aligned = true; anchor = vs - session.ShiftTicks;
                     skip = Math.Max(0, produced - Expected());
                 }
                 else if (!aligned && Expected() > 15L * Rate)
@@ -396,10 +488,21 @@ sealed class AudioTap
                 }
                 try
                 {
-                    if (cap != null) Drain(Emit, ref buf, () => skip <= 0 && produced - Expected() > Rate / 5);
-                    else if (Environment.TickCount64 >= nextReopen) { nextReopen = Environment.TickCount64 + 2000; Reopen(); }
+                    if (cap != null)
+                    {
+                        Drain(Emit, ref buf, () => skip <= 0 && produced - Expected() > Rate / 5);
+                        // Every 2 s: has Windows' default device changed (e.g. switched to headphones)? Then follow it.
+                        if (Environment.TickCount64 >= nextCheck)
+                        {
+                            nextCheck = Environment.TickCount64 + 2000;
+                            bool test = Environment.TickCount64 >= testSwitchAt;
+                            if (test) testSwitchAt = long.MaxValue;
+                            if (test || DefaultChanged()) Reopen(test ? "test: pretended the default device changed" : "default device changed");
+                        }
+                    }
+                    else if (Environment.TickCount64 >= nextReopen) { nextReopen = Environment.TickCount64 + 2000; Reopen("device back"); }
                 }
-                catch (Exception e) { cap = null; client = null; Note("device lost, writing silence until it returns (" + e.Message + ")"); } // keep the track alive
+                catch (Exception e) { try { client?.Stop(); } catch { } cap = null; client = null; Note("device lost, writing silence until it returns (" + e.Message + ")"); } // keep the track alive
 
                 long behind = Expected() - produced;
                 if (behind > Rate / 10)
@@ -447,6 +550,8 @@ interface IMMDeviceEnumerator
 interface IMMDevice
 {
     void Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+    void OpenPropertyStore(int access, out IntPtr store);
+    void GetId(out IntPtr id);
 }
 
 [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
