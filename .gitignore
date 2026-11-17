@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+app/
+
+# Test folder: keep the scripts only (recordings, screenshots and logs are screen captures of this PC)
+test/*
+!test/*.ps1
+
+# Recordings and logs anywhere
+*.mkv
+*.mp4
+*.log
+layout.json
