@@ -29,7 +29,17 @@ sealed class Settings
     public int Qp { get; set; } = 26;
     public int SegmentMinutes { get; set; } = 10;
     public bool SystemAudio { get; set; } = true;
+    public string SystemDevice { get; set; }          // null = Windows default playback device (followed)
+    public int SystemChannels { get; set; } = 2;
+    public int SystemVolume { get; set; } = 100;      // percent
     public bool Mic { get; set; } = true;
+    public string MicDevice { get; set; }             // null = Windows default microphone (followed)
+    public int MicChannels { get; set; } = 1;
+    public int MicVolume { get; set; } = 100;
+    public bool MixTrack { get; set; } = true;        // System + Mic together as one more track
+    public int MixChannels { get; set; } = 1;
+    public string FirstTrack { get; set; } = "Mix";   // written first and played by default
+    public bool RecordOnLaunch { get; set; } = true;  // false: opening TriRec leaves it stopped in the tray
     // Sound moved this many ms later (negative = earlier). Leave out (null) for the measured automatic value.
     public int? AudioShiftMs { get; set; }
 
@@ -51,7 +61,11 @@ sealed class Settings
     }
 
     public Options ToOptions(string outOverride) => new(Fps, Qp, 20, SegmentMinutes * 60, 0,
-        Path.GetFullPath(outOverride ?? OutDir), SystemAudio, Mic, Hidden: true, AudioShiftMs);
+        Path.GetFullPath(outOverride ?? OutDir), SystemAudio, Mic, Hidden: true, AudioShiftMs,
+        new Source(SystemDevice, SystemChannels, SystemVolume), new Source(MicDevice, MicChannels, MicVolume),
+        MixTrack, MixChannels, FirstTrack);
+
+    public Settings Clone() => (Settings)MemberwiseClone();
 }
 
 // "Start with Windows" = TriRec.lnk in the current user's Startup folder, pointing at this exe.
@@ -84,99 +98,6 @@ static class AutoStart
         else if (File.Exists(Lnk)) File.Delete(Lnk);
         if (LegacyRun()) { using var k = Registry.CurrentUser.OpenSubKey(RunKey, true); k.DeleteValue(Name); }
     }
-}
-
-sealed class SettingsForm : Form
-{
-    static readonly (string Label, int Qp)[] Qualities =
-    {
-        ("Sharpest (largest files)", 20), ("High", 23), ("Standard", 26), ("Smaller files", 30), ("Smallest (soft text)", 34),
-    };
-
-    readonly TextBox folder = new() { Width = 330 };
-    public readonly NumericUpDown Fps = new() { Minimum = 1, Maximum = 60, Width = 70 };
-    readonly NumericUpDown minutes = new() { Minimum = 1, Maximum = 120, Width = 70 };
-    readonly ComboBox quality = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220 };
-    readonly CheckBox sys = new() { Text = "Record system sound", AutoSize = true };
-    readonly CheckBox mic = new() { Text = "Record microphone", AutoSize = true };
-    readonly CheckBox auto = new() { Text = "Start with Windows", AutoSize = true };
-    public readonly Button SaveButton = new() { Text = "Save", AutoSize = true, MinimumSize = new Size(90, 0) };
-    readonly List<int> qps = new();
-    public bool Saved, SavedAutoStart;
-    public Settings SavedSettings;
-
-    public SettingsForm(Settings s, bool autoStart, Icon icon)
-    {
-        Text = "TriRec settings";
-        Icon = icon;
-        AutoScaleMode = AutoScaleMode.Dpi;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = MinimizeBox = false;
-        StartPosition = FormStartPosition.CenterScreen;
-        AutoSize = true; AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        Padding = new Padding(14);
-
-        foreach (var q in Qualities) { quality.Items.Add(q.Label); qps.Add(q.Qp); }
-        if (!qps.Contains(s.Qp)) { quality.Items.Add($"Custom (qp {s.Qp})"); qps.Add(s.Qp); }
-        quality.SelectedIndex = qps.IndexOf(s.Qp);
-        folder.Text = s.OutDir;
-        Fps.Value = Math.Clamp(s.Fps, 1, 60);
-        minutes.Value = Math.Clamp(s.SegmentMinutes, 1, 120);
-        sys.Checked = s.SystemAudio; mic.Checked = s.Mic; auto.Checked = autoStart;
-
-        var browse = new Button { Text = "Browse...", AutoSize = true };
-        browse.Click += (_, _) =>
-        {
-            using var d = new FolderBrowserDialog { SelectedPath = folder.Text, Description = "Folder for recordings", UseDescriptionForTitle = true };
-            if (d.ShowDialog(this) == DialogResult.OK) folder.Text = d.SelectedPath;
-        };
-        var cancel = new Button { Text = "Cancel", AutoSize = true, MinimumSize = new Size(90, 0) };
-        cancel.Click += (_, _) => Close();
-        SaveButton.Click += (_, _) =>
-        {
-            try { Directory.CreateDirectory(Path.GetFullPath(folder.Text.Trim())); }
-            catch (Exception e) { MessageBox.Show(this, "That folder cannot be used:\n\n" + e.Message, "TriRec"); return; }
-            SavedSettings = Result(); SavedAutoStart = auto.Checked; // capture now: the controls are gone once the window closes
-            Saved = true;
-            Close();
-        };
-        AcceptButton = SaveButton; CancelButton = cancel;
-
-        var grid = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Fill };
-        void Row(string label, Control c)
-        {
-            grid.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 8, 12, 8) });
-            c.Anchor = AnchorStyles.Left; c.Margin = new Padding(3, 5, 3, 5);
-            grid.Controls.Add(c);
-        }
-        FlowLayoutPanel Flow(params Control[] cs)
-        {
-            var f = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = Padding.Empty };
-            foreach (var c in cs) { c.Anchor = AnchorStyles.Left; f.Controls.Add(c); }
-            return f;
-        }
-        Label Hint(string t) => new() { Text = t, AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(6, 6, 3, 3) };
-
-        Row("Recordings folder", Flow(folder, browse));
-        Row("Frames per second", Flow(Fps, Hint("10 is light; higher is smoother and heavier")));
-        Row("Quality", quality);
-        Row("New file every", Flow(minutes, Hint("minutes")));
-        Row("Sound", Flow(sys, mic));
-        Row("Windows", auto);
-        var buttons = Flow(SaveButton, cancel);
-        buttons.Anchor = AnchorStyles.Right; buttons.Margin = new Padding(3, 14, 3, 0);
-        grid.Controls.Add(Hint("Saving restarts the recording (if one is running); a new file begins."));
-        grid.SetColumnSpan(grid.Controls[^1], 2);
-        grid.Controls.Add(buttons);
-        grid.SetColumnSpan(buttons, 2);
-        Controls.Add(grid);
-    }
-
-    Settings Result() => new()
-    {
-        OutDir = Path.GetFullPath(folder.Text.Trim()), Fps = (int)Fps.Value, Qp = qps[quality.SelectedIndex],
-        SegmentMinutes = (int)minutes.Value, SystemAudio = sys.Checked, Mic = mic.Checked,
-    };
 }
 
 // Global hotkey Ctrl+Alt+M (works while a game has focus). Ok is false if another program already owns it.
@@ -283,7 +204,8 @@ static class Tray
         icon.ContextMenuStrip = menu;
         icon.DoubleClick += (_, _) => ShowSettings();
 
-        StartRecording();
+        if (settings.RecordOnLaunch) StartRecording();
+        else { paused = true; opts = settings.ToOptions(outOverride); Recorder.Log("TriRec opened; recording not started (setting)"); }
         if (args.Contains("--settings")) ShowSettings();
 
         // UI-thread timer: keeps the tooltip current, notices ffmpeg dying, and listens for --stop / --settings.
@@ -423,7 +345,7 @@ static class Tray
     static void ShowSettings()
     {
         if (form != null) { form.Activate(); return; }
-        form = new SettingsForm(settings, AutoStart.Enabled, AppIcon());
+        form = new SettingsForm(settings, AutoStart.Enabled, AppIcon(), State);
         form.FormClosed += (_, _) =>
         {
             var f = form;
@@ -455,17 +377,22 @@ static class Tray
         return true;
     }
 
-    // TriRecTray --settings-shot FILE.png [--shot-save]: draw the settings window to a picture;
-    // with --shot-save also set 12 fps and press Save, to prove the save path writes the file.
+    // TriRecTray --settings-shot FILE.png [--shot-save]: picture of each settings tab (FILE-1.png, FILE-2.png ...),
+    // taken from the screen; with --shot-save also set 12 fps and press Save, to prove the save path writes the file.
     static void Shot(string[] args)
     {
-        var f = new SettingsForm(Settings.Load(), AutoStart.Enabled, red);
+        var f = new SettingsForm(Settings.Load(), AutoStart.Enabled, AppIcon(), () => "Recording for 0h 12m (preview)") { TopMost = true };
         f.Show();
-        Application.DoEvents();
-        using (var bmp = new Bitmap(f.Width, f.Height))
+        string file = Options.Str(args, "--settings-shot", "settings.png");
+        for (int i = 0; i < f.Tabs.TabCount; i++)
         {
-            f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
-            bmp.Save(Options.Str(args, "--settings-shot", "settings.png"), ImageFormat.Png);
+            f.Tabs.SelectedIndex = i;
+            var until = Environment.TickCount64 + 600; // let the level meters and painting settle
+            while (Environment.TickCount64 < until) { Application.DoEvents(); Thread.Sleep(15); }
+            var b = f.Bounds;
+            using var bmp = new Bitmap(b.Width, b.Height);
+            using (var g = Graphics.FromImage(bmp)) g.CopyFromScreen(b.Location, Point.Empty, b.Size);
+            bmp.Save(Path.ChangeExtension(file, null) + $"-{i + 1}.png", ImageFormat.Png);
         }
         if (args.Contains("--shot-save"))
         {

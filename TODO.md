@@ -74,6 +74,20 @@ Open, not fixed (each is new behaviour, the owner decides):
 - Ctrl+Alt+M / menu "Mark this moment" / `--mark`: appends "hh:mm:ss (clock)" to `<file>.marks.txt`.
   Tested with the switch and a real keypress.
 
+## Settings window v2 (2026-11-17)
+- Tabs: Recording, Sound, Tracks, Advanced; status line at the bottom. Code in `TriRecTray\SettingsForm.cs`.
+- Sound, per source: on/off, device (Windows default = followed, or a chosen device; falls back to the default
+  while the chosen one is unplugged and returns to it), channels, volume 0-200 %, live level meter.
+- Tracks: Mix on/off, Mix mono/stereo, which track is first (default). `Options.TrackPlan` decides the order.
+- Advanced: sync automatic or by hand; Ctrl+Alt+M note; settings file and ffmpeg location.
+- New: "Start recording as soon as TriRec opens" (off = opens stopped).
+- `trirec devices` lists sound devices with ids.
+- Test: `test\sound-options-test.ps1 -MicId ...` (order, channels, default flag, volume, chosen device). 7/7.
+- Found: the Windows default mic is "Microphone (Virtual Desktop Audio)", which is near silent (peak -43 dB);
+  the Yeti peaked at -11.7 dB. The owner's settings still use the default; pick the Yeti in Sound if it is the real mic.
+- NOT tested: clicking through the window by hand; Save from the new window (the save code path is
+  the same as before but the form is new); unplugging a chosen device mid-recording.
+
 ## 3. Never tested
 - Clicking the tray menu and how the icon looks (stop/start/exit were tested with the switches).
 - Saving settings while recording is stopped.

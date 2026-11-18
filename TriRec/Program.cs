@@ -3,6 +3,7 @@
 //   trirec [--fps 10] [--qp 26] [--gop 20] [--segment 600] [--out DIR]
 //          [--seconds N] [--no-audio] [--no-mic]
 //   trirec crop FILE MONITOR [--qp 24]
+//   trirec devices
 using System.Diagnostics;
 using System.Text.Json;
 
@@ -14,6 +15,7 @@ static class Program
     {
         try
         {
+            if (args.Length > 0 && args[0] == "devices") return Devices();
             return args.Length > 0 && args[0] == "crop" ? Crop(args) : Record(args);
         }
         catch (Exception e)
@@ -41,6 +43,20 @@ static class Program
         foreach (var f in new DirectoryInfo(s.OutDir).GetFiles("*.mkv").Where(f => f.LastWriteTime >= s.Started.AddSeconds(-1)))
             Console.WriteLine($"  {f.Name}  {f.Length / 1048576.0:F1} MB");
         return s.Ff.ExitCode;
+    }
+
+    // trirec devices: the sound devices and their ids (for SystemDevice / MicDevice in settings.json).
+    static int Devices()
+    {
+        foreach (bool render in new[] { true, false })
+        {
+            string def = AudioDevices.DefaultId(render);
+            Console.WriteLine(render ? "Playback (system sound):" : "Recording (microphone):");
+            foreach (var d in AudioDevices.List(render))
+                Console.WriteLine($"  {(d.Id == def ? "*" : " ")} {d.Name}\n      {d.Id}");
+        }
+        Console.WriteLine("(* = Windows default)");
+        return 0;
     }
 
     static int Crop(string[] args)

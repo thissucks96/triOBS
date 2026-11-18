@@ -14,11 +14,32 @@ namespace TriRec;
 
 record Mon(int Idx, int W, int H, int X, int Y);
 
+// One sound source. Device: endpoint id, null = the Windows default (followed when it changes).
+// Channels: 1 or 2, Windows converts. Volume: percent, applied to the source's own track and to the Mix.
+record Source(string Device = null, int Channels = 2, int Volume = 100);
+
 // AudioShiftMs: all sound is moved this much later (negative = earlier) against the picture. null = AutoShift(fps).
+// MixTrack: also write System + Mic together as one track (when both are recorded). FirstTrack: "Mix", "System"
+// or "Mic"; that track is written first and marked default, the rest follow in the order Mix, System, Mic.
 record Options(int Fps, int Qp, int Gop, int Segment, int Seconds, string OutDir, bool Audio, bool Mic, bool Hidden,
-               int? AudioShiftMs = null)
+               int? AudioShiftMs = null, Source SystemSource = null, Source MicSource = null,
+               bool MixTrack = true, int MixChannels = 1, string FirstTrack = "Mix")
 {
     public int Shift => AudioShiftMs ?? AutoShift(Fps);
+    public Source Sys => SystemSource ?? new(null, 2, 100);
+    public Source MicSrc => MicSource ?? new(null, 1, 100);
+
+    // The sound tracks a recording gets, in file order. Shared with the settings window so it shows the same list.
+    public static List<(string Title, int Channels)> TrackPlan(bool sys, int sysCh, bool mic, int micCh, bool mix, int mixCh, string first)
+    {
+        var t = new List<(string Title, int Channels)>();
+        if (sys && mic && mix) t.Add(("Mix", mixCh));
+        if (sys) t.Add(("System", sysCh));
+        if (mic) t.Add(("Mic", micCh));
+        int i = t.FindIndex(x => x.Title == first);
+        if (i > 0) { var f = t[i]; t.RemoveAt(i); t.Insert(0, f); }
+        return t;
+    }
 
     // Measured 2026-11-17 with test\sync-test.ps1 (sound vs picture with no shift): 10 fps -0.03 s, 15 fps +0.10 s,
     // 23 fps +0.20 s, 30 fps +0.20 s (positive = sound late). The shift undoes that, straight lines in between.
@@ -101,8 +122,8 @@ static class Recorder
         }, new JsonSerializerOptions { WriteIndented = true }));
 
         var taps = new List<AudioTap>();
-        if (o.Audio) AddTap(taps, true, "System");
-        if (o.Mic) AddTap(taps, false, "Mic");
+        if (o.Audio) AddTap(taps, true, "System", o.Sys);
+        if (o.Mic) AddTap(taps, false, "Mic", o.MicSrc);
 
         var psi = new ProcessStartInfo("ffmpeg")
         {
@@ -125,32 +146,30 @@ static class Recorder
             ? "[m0]null[v]"
             : string.Concat(mons.Select((_, i) => $"[m{i}]")) +
               $"xstack=inputs={mons.Count}:layout={string.Join("|", mons.Select(m => $"{m.X}_{m.Y}"))}:fill=black[v]";
-        // Sound tracks: Mix = System + Mic in mono (track 1, default), System (stereo, as played), Mic (mono).
-        // Each input is the wall-clock-aligned pipe from its tap, so the two line up in the mix.
+        // Sound tracks (see Options.TrackPlan): System and Mic as captured (Windows already delivers the chosen
+        // channel count), each at its own volume, plus Mix = both together. Each input is the wall-clock-aligned
+        // pipe from its tap, so the two line up in the mix.
         var audio = new List<string>();
-        var tracks = new List<(string Pad, string Title, int Channels)>();
         int si = taps.FindIndex(t => t.Title == "System"), mi = taps.FindIndex(t => t.Title == "Mic");
-        bool mix = si >= 0 && mi >= 0;
-        const string Mono = "aresample=48000,aformat=sample_rates=48000:channel_layouts=mono";
-        string In(int i) => $"[{i}:a]";
-        if (si >= 0)
+        var plan = Options.TrackPlan(si >= 0, o.Sys.Channels, mi >= 0, o.MicSrc.Channels, o.MixTrack, o.MixChannels, o.FirstTrack);
+        bool mix = plan.Any(t => t.Title == "Mix");
+        void Source(int input, string label, int volume)
         {
-            audio.Add(In(si) + (mix ? "asplit=2[sys][sysmix]" : "anull[sys]"));
-            tracks.Add(("[sys]", "System", 2));
+            string vol = volume == 100 ? "" : FormattableString.Invariant($"volume={volume / 100.0:0.###},");
+            audio.Add($"[{input}:a]{vol}" + (mix ? $"asplit=2[{label}][{label}mix]" : $"anull[{label}]"));
         }
-        if (mi >= 0)
-        {
-            audio.Add(In(mi) + Mono + (mix ? ",asplit=2[mic][micmix]" : "[mic]"));
-            tracks.Add(("[mic]", "Mic", 1));
-        }
+        if (si >= 0) Source(si, "sys", o.Sys.Volume);
+        if (mi >= 0) Source(mi, "mic", o.MicSrc.Volume);
         if (mix)
         {
+            string fmt = "aresample=48000,aformat=sample_rates=48000:channel_layouts=" + (o.MixChannels == 1 ? "mono" : "stereo");
             // normalize=0 keeps both at full level instead of halving each; the limiter then keeps loud moments
             // (game sound plus speech) under -1 dB instead of clipping. level=0: no automatic gain, latency=1: no delay.
-            audio.Add($"[sysmix]{Mono}[sysmono];[sysmono][micmix]amix=inputs=2:duration=longest:normalize=0," +
+            audio.Add($"[sysmix]{fmt}[sysm];[micmix]{fmt}[micm];[sysm][micm]amix=inputs=2:duration=longest:normalize=0," +
                       "alimiter=limit=0.891:attack=5:release=50:level=0:latency=1[mix]");
-            tracks.Insert(0, ("[mix]", "Mix", 1)); // first track, and the one players pick by default
         }
+        var pads = new Dictionary<string, string> { ["Mix"] = "[mix]", ["System"] = "[sys]", ["Mic"] = "[mic]" };
+        var tracks = plan.Select(t => (Pad: pads[t.Title], t.Title, t.Channels)).ToList();
         a.Add("-filter_complex"); a.Add(string.Join(";", new[] { grab, stack }.Concat(audio)));
 
         a.Add("-map"); a.Add("[v]");
@@ -208,14 +227,16 @@ static class Recorder
 
     static int pipeSerial;
 
-    static void AddTap(List<AudioTap> taps, bool loopback, string title)
+    static void AddTap(List<AudioTap> taps, bool loopback, string title, Source src)
     {
         try
         {
             // A new pipe name for every recording: the tray app starts several in one process.
-            var t = new AudioTap(loopback, title, $"trirec_{title.ToLowerInvariant()}_{Environment.ProcessId}_{Interlocked.Increment(ref pipeSerial)}");
+            var t = new AudioTap(loopback, title, $"trirec_{title.ToLowerInvariant()}_{Environment.ProcessId}_{Interlocked.Increment(ref pipeSerial)}",
+                                 src.Device, src.Channels);
             taps.Add(t);
-            Log($"  audio {title}: {t.Rate} Hz, {t.Channels} ch, {t.Fmt}");
+            Log($"  audio {title}: {t.Rate} Hz, {t.Channels} ch, {t.Fmt}, volume {src.Volume}%, " +
+                (src.Device == null ? "Windows default device" : "chosen device") + $" ({AudioDevices.Name(t.DeviceId) ?? "?"})");
         }
         catch (Exception e)
         {
@@ -295,6 +316,9 @@ sealed class AudioTap
     readonly NamedPipeServerStream pipe;
     byte[] format;    // the WAVEFORMATEX this recording uses; every device after the first is asked for it too
     string deviceId;  // the device being captured, to notice when the Windows default changes
+    readonly string wantId; // the chosen device (null = Windows default)
+    readonly int wantChannels;
+    public string DeviceId => deviceId;
 
     const int Loopback = 0x00020000, AutoConvert = unchecked((int)0x80000000) | 0x08000000; // AUTOCONVERTPCM | SRC_DEFAULT_QUALITY
     // Test hooks: TRIREC_TEST_RATE asks for another rate (proves Windows' conversion), TRIREC_TEST_SWITCH_SEC
@@ -302,9 +326,10 @@ sealed class AudioTap
     static readonly int TestRate = int.TryParse(Environment.GetEnvironmentVariable("TRIREC_TEST_RATE"), out int r) ? r : 48000;
     static readonly int TestSwitchSec = int.TryParse(Environment.GetEnvironmentVariable("TRIREC_TEST_SWITCH_SEC"), out int s) ? s : 0;
 
-    public AudioTap(bool loopback, string title, string pipeName)
+    public AudioTap(bool loopback, string title, string pipeName, string device = null, int channels = 0)
     {
-        this.loopback = loopback; Title = title; PipeName = pipeName;
+        this.loopback = loopback; Title = title; PipeName = pipeName; wantId = device;
+        wantChannels = channels is 1 or 2 ? channels : (loopback ? 2 : 1);
         Open(first: true);
         // ~100 ms of pipe buffer: small, so little stale audio sits in it while ffmpeg starts up
         pipe = new NamedPipeServerStream(pipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte,
@@ -324,12 +349,13 @@ sealed class AudioTap
     // channel count still fits this recording. If a device refuses that, fall back to its own format.
     void Open(bool first)
     {
-        var dev = DefaultDevice(out string id);
+        var dev = Target(out string id);
         int flags = loopback ? Loopback : 0;
         IAudioClient c;
         if (first)
         {
-            format = Wave(TestRate, loopback ? 2 : 1);
+            format = Wave(TestRate, wantChannels);
+            if (wantId != null && id != wantId) Recorder.Log($"  audio {Title}: the chosen device is not connected; using the Windows default until it is");
             c = Activate(dev);
             if (!TryInit(c, flags | AutoConvert, format))
             {
@@ -357,12 +383,20 @@ sealed class AudioTap
         client = c; cap = (IAudioCaptureClient)co; deviceId = id;
     }
 
-    IMMDevice DefaultDevice(out string id)
+    // The device to capture: the chosen one if it is connected, otherwise the Windows default.
+    IMMDevice Target(out string id)
     {
         var en = (IMMDeviceEnumerator)new MMDeviceEnumerator(); // a fresh one on the calling thread
+        if (wantId != null)
+            try
+            {
+                en.GetDevice(wantId, out var d);
+                d.GetState(out int state);
+                if (state == 1) { id = wantId; return d; } // DEVICE_STATE_ACTIVE
+            }
+            catch { } // unknown id: fall through to the default
         en.GetDefaultAudioEndpoint(loopback ? 0 : 1, 0, out var dev);
-        dev.GetId(out IntPtr p);
-        try { id = Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+        id = AudioDevices.Id(dev);
         return dev;
     }
 
@@ -405,18 +439,20 @@ sealed class AudioTap
         return b;
     }
 
-    // Switch to the current default device (after it changed or the old one was lost).
+    // Switch to the device that should be captured now (after a change, or after the old one was lost).
     void Reopen(string why)
     {
         try { client?.Stop(); } catch { }
         cap = null; client = null;
-        try { Open(first: false); Note(why + ", capturing from the default device"); }
+        try { Open(first: false); Note($"{why}, capturing from {AudioDevices.Name(deviceId) ?? "the default device"}"); }
         catch (Exception e) { Note("no usable device yet, writing silence (" + e.Message + ")"); }
     }
 
+    // True when a different device should be captured now: the Windows default changed (following the default),
+    // or the chosen device came back (after falling back to the default).
     bool DefaultChanged()
     {
-        try { DefaultDevice(out string id); return id != deviceId; }
+        try { Target(out string id); return id != deviceId; }
         catch { return true; } // no default device at all: Reopen will say so
     }
 
@@ -497,7 +533,7 @@ sealed class AudioTap
                             nextCheck = Environment.TickCount64 + 2000;
                             bool test = Environment.TickCount64 >= testSwitchAt;
                             if (test) testSwitchAt = long.MaxValue;
-                            if (test || DefaultChanged()) Reopen(test ? "test: pretended the default device changed" : "default device changed");
+                            if (test || DefaultChanged()) Reopen(test ? "test: pretended the default device changed" : wantId == null ? "default device changed" : "device changed");
                         }
                     }
                     else if (Environment.TickCount64 >= nextReopen) { nextReopen = Environment.TickCount64 + 2000; Reopen("device back"); }
@@ -542,16 +578,108 @@ class MMDeviceEnumerator { }
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IMMDeviceEnumerator
 {
-    void EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+    void EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
     void GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+    void GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+}
+
+[ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceCollection
+{
+    void GetCount(out uint count);
+    void Item(uint index, out IMMDevice device);
 }
 
 [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IMMDevice
 {
     void Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
-    void OpenPropertyStore(int access, out IntPtr store);
+    void OpenPropertyStore(int access, out IPropertyStore store);
     void GetId(out IntPtr id);
+    void GetState(out int state);
+}
+
+[StructLayout(LayoutKind.Sequential)]
+struct PropertyKey { public Guid Fmt; public int Pid; }
+
+[StructLayout(LayoutKind.Explicit, Size = 24)]
+struct PropVariant { [FieldOffset(0)] public ushort Vt; [FieldOffset(8)] public IntPtr Ptr; }
+
+[ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IPropertyStore
+{
+    void GetCount(out uint count);
+    void GetAt(uint index, out PropertyKey key);
+    void GetValue(ref PropertyKey key, out PropVariant value);
+}
+
+[ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioMeterInformation
+{
+    void GetPeakValue(out float peak);
+}
+
+// Lists sound devices by name and reads their live level, for the settings window and the log.
+static class AudioDevices
+{
+    [DllImport("ole32.dll")] static extern int PropVariantClear(ref PropVariant pv);
+    static PropertyKey FriendlyName = new() { Fmt = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), Pid = 14 };
+    static IMMDeviceEnumerator En() => (IMMDeviceEnumerator)new MMDeviceEnumerator();
+
+    public static string Id(IMMDevice d)
+    {
+        d.GetId(out IntPtr p);
+        try { return Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+    }
+
+    static string Name(IMMDevice d)
+    {
+        d.OpenPropertyStore(0, out var store); // STGM_READ
+        store.GetValue(ref FriendlyName, out var v);
+        try { return v.Vt == 31 ? Marshal.PtrToStringUni(v.Ptr) : null; } // VT_LPWSTR
+        finally { PropVariantClear(ref v); }
+    }
+
+    public static string Name(string id)
+    {
+        if (id == null) return null;
+        try { En().GetDevice(id, out var d); return Name(d); } catch { return null; }
+    }
+
+    // Connected devices: playback (render = true) or recording.
+    public static List<(string Id, string Name)> List(bool render)
+    {
+        var list = new List<(string, string)>();
+        try
+        {
+            En().EnumAudioEndpoints(render ? 0 : 1, 1, out var col); // DEVICE_STATE_ACTIVE
+            col.GetCount(out uint n);
+            for (uint i = 0; i < n; i++) { col.Item(i, out var d); list.Add((Id(d), Name(d) ?? "(unnamed device)")); }
+        }
+        catch { }
+        return list;
+    }
+
+    public static string DefaultId(bool render)
+    {
+        try { En().GetDefaultAudioEndpoint(render ? 0 : 1, 0, out var d); return Id(d); } catch { return null; }
+    }
+
+    // Level meter of a device (null id = the current default). Recording devices only show a level while
+    // something is capturing from them, e.g. TriRec itself.
+    public static IAudioMeterInformation Meter(bool render, string id)
+    {
+        try
+        {
+            var en = En();
+            IMMDevice d;
+            if (id != null) en.GetDevice(id, out d); else en.GetDefaultAudioEndpoint(render ? 0 : 1, 0, out d);
+            var iid = typeof(IAudioMeterInformation).GUID;
+            d.Activate(ref iid, 23, IntPtr.Zero, out var o);
+            return (IAudioMeterInformation)o;
+        }
+        catch { return null; }
+    }
 }
 
 [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
