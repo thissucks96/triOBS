@@ -88,18 +88,18 @@ sealed class SourcePanel
 {
     public readonly bool Render;
     public readonly CheckBox On;
-    public readonly ComboBox Device = Ui.Combo(390), Channels = Ui.Combo(110);
+    public readonly ComboBox Device = Ui.Combo(390), Backup = Ui.Combo(390), Channels = Ui.Combo(110);
     public readonly TrackBar Volume = new() { Minimum = 0, Maximum = 200, TickFrequency = 25, SmallChange = 5, LargeChange = 25, AutoSize = false, Size = new Size(240, 30) };
     readonly Label volumeText = new() { AutoSize = true, Anchor = AnchorStyles.Left };
     readonly LevelMeter meter = new();
-    readonly List<string> ids = new();
+    readonly List<string> ids = new(), backupIds = new();
     readonly List<Control> parts = new();
     IAudioMeterInformation source;
     public readonly GroupBox Box;
 
     public event Action Changed;
 
-    public SourcePanel(string title, string onText, bool render, bool on, string device, int channels, int volume, string note)
+    public SourcePanel(string title, string onText, bool render, bool on, string device, string backup, int channels, int volume, string note)
     {
         Render = render;
         On = Ui.Check(onText); On.Checked = on;
@@ -111,12 +111,18 @@ sealed class SourcePanel
         Device.SelectedIndex = Math.Max(0, ids.IndexOf(device));
         Device.DropDownWidth = 420;
 
+        Backup.Items.Add("None (go to the Windows default)"); backupIds.Add(null);
+        foreach (var d in AudioDevices.List(render)) { Backup.Items.Add(d.Name); backupIds.Add(d.Id); }
+        if (backup != null && !backupIds.Contains(backup)) { Backup.Items.Add("Not connected: " + (AudioDevices.Name(backup) ?? "saved device")); backupIds.Add(backup); }
+        Backup.SelectedIndex = Math.Max(0, backupIds.IndexOf(backup));
+        Backup.DropDownWidth = 420;
+
         Channels.Items.AddRange(new object[] { "Stereo", "Mono" });
         Channels.SelectedIndex = channels == 1 ? 1 : 0;
         Volume.Value = Math.Clamp(volume, 0, 200);
         ShowVolume();
 
-        Device.SelectedIndexChanged += (_, _) => { Hook(); Changed?.Invoke(); };
+        Device.SelectedIndexChanged += (_, _) => { Hook(); Backup.Enabled = On.Checked && DeviceId != null; Changed?.Invoke(); };
         Channels.SelectedIndexChanged += (_, _) => Changed?.Invoke();
         Volume.ValueChanged += (_, _) => ShowVolume();
         On.CheckedChanged += (_, _) => { Enable(); Changed?.Invoke(); };
@@ -131,6 +137,7 @@ sealed class SourcePanel
         }
         t.Controls.Add(On); t.SetColumnSpan(On, 2); On.Margin = new Padding(0, 2, 0, 6);
         Row("Device", Device);
+        Row("If not connected", Backup);
         Row("Level", meter);
         Row("Channels", Channels);
         Row("Volume", Ui.Flow(Volume, volumeText));
@@ -142,11 +149,12 @@ sealed class SourcePanel
     }
 
     public string DeviceId => ids[Device.SelectedIndex];
+    public string BackupId => DeviceId == null ? null : backupIds[Backup.SelectedIndex]; // no backup when following the default
     public int ChannelCount => Channels.SelectedIndex == 1 ? 1 : 2;
 
     void ShowVolume() => volumeText.Text = Volume.Value == 100 ? "100 % (as is)" : $"{Volume.Value} %";
     void Hook() => source = AudioDevices.Meter(Render, DeviceId);
-    void Enable() { foreach (var c in parts) c.Enabled = On.Checked; }
+    void Enable() { foreach (var c in parts) c.Enabled = On.Checked; Backup.Enabled = On.Checked && DeviceId != null; }
 
     // Called about 20 times a second: the bar shows the device level after the volume setting.
     public void Tick()
@@ -209,10 +217,11 @@ sealed class SettingsForm : Form
         minutes.Value = Math.Clamp(s.SegmentMinutes, 1, 240);
         auto.Checked = autoStart;
         recordOnLaunch.Checked = s.RecordOnLaunch;
-        sys = new SourcePanel("System sound (what you hear)", "Record system sound", true, s.SystemAudio, s.SystemDevice, s.SystemChannels, s.SystemVolume,
+        sys = new SourcePanel("System sound (what you hear)", "Record system sound", true, s.SystemAudio, s.SystemDevice, s.SystemBackup, s.SystemChannels, s.SystemVolume,
             "\"Windows default\" follows the playback device you pick in Windows, e.g. when you switch to headphones.");
-        mic = new SourcePanel("Microphone", "Record microphone", false, s.Mic, s.MicDevice, s.MicChannels, s.MicVolume,
-            "The level bar moves only while something records from the microphone (TriRec itself, when recording).");
+        mic = new SourcePanel("Microphone", "Record microphone", false, s.Mic, s.MicDevice, s.MicBackup, s.MicChannels, s.MicVolume,
+            "If the chosen device is unplugged, the backup is used, then the Windows default; TriRec switches back " +
+            "within 2 s when it returns. The level bar moves only while something records from the microphone.");
         mixOn.Checked = s.MixTrack;
         mixCh.Items.AddRange(new object[] { "Stereo", "Mono" }); mixCh.SelectedIndex = s.MixChannels == 1 ? 1 : 0;
         syncAuto.Checked = s.AudioShiftMs == null; syncManual.Checked = !syncAuto.Checked;
@@ -362,8 +371,8 @@ sealed class SettingsForm : Form
         var r = original.Clone();
         r.OutDir = Path.GetFullPath(folder.Text.Trim());
         r.Fps = (int)Fps.Value; r.Qp = qps[quality.SelectedIndex]; r.SegmentMinutes = (int)minutes.Value;
-        r.SystemAudio = sys.On.Checked; r.SystemDevice = sys.DeviceId; r.SystemChannels = sys.ChannelCount; r.SystemVolume = sys.Volume.Value;
-        r.Mic = mic.On.Checked; r.MicDevice = mic.DeviceId; r.MicChannels = mic.ChannelCount; r.MicVolume = mic.Volume.Value;
+        r.SystemAudio = sys.On.Checked; r.SystemDevice = sys.DeviceId; r.SystemBackup = sys.BackupId; r.SystemChannels = sys.ChannelCount; r.SystemVolume = sys.Volume.Value;
+        r.Mic = mic.On.Checked; r.MicDevice = mic.DeviceId; r.MicBackup = mic.BackupId; r.MicChannels = mic.ChannelCount; r.MicVolume = mic.Volume.Value;
         r.MixTrack = mixOn.Checked; r.MixChannels = mixCh.SelectedIndex == 1 ? 1 : 2; r.FirstTrack = first.SelectedItem as string ?? "Mix";
         r.RecordOnLaunch = recordOnLaunch.Checked;
         r.AudioShiftMs = syncManual.Checked ? (int)syncMs.Value : null;

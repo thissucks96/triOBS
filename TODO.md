@@ -88,6 +88,13 @@ Open, not fixed (each is new behaviour, the owner decides):
 - NOT tested: clicking through the window by hand; Save from the new window (the save code path is
   the same as before but the form is new); unplugging a chosen device mid-recording.
 
+## Backup device (2026-11-19)
+- Each source has "If not connected": order is chosen device, backup, Windows default; checked every 2 s, so it
+  moves back up as soon as a better one is connected. Settings: `SystemBackup`, `MicBackup`. Log says which one is used.
+- Owner's mic: Focusrite "Analogue 1 + 2" first, Yeti as backup.
+- Test: `test\backup-device-test.ps1 -Main ... -Backup ...` (a made-up id stands in for an unplugged device). 7/7.
+- NOT tested: really unplugging the Focusrite mid-recording and plugging it back in.
+
 ## 3. Never tested
 - Clicking the tray menu and how the icon looks (stop/start/exit were tested with the switches).
 - Saving settings while recording is stopped.

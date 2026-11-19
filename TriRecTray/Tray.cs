@@ -30,10 +30,12 @@ sealed class Settings
     public int SegmentMinutes { get; set; } = 10;
     public bool SystemAudio { get; set; } = true;
     public string SystemDevice { get; set; }          // null = Windows default playback device (followed)
+    public string SystemBackup { get; set; }          // used while SystemDevice is not connected (null = go to the default)
     public int SystemChannels { get; set; } = 2;
     public int SystemVolume { get; set; } = 100;      // percent
     public bool Mic { get; set; } = true;
     public string MicDevice { get; set; }             // null = Windows default microphone (followed)
+    public string MicBackup { get; set; }             // used while MicDevice is not connected
     public int MicChannels { get; set; } = 1;
     public int MicVolume { get; set; } = 100;
     public bool MixTrack { get; set; } = true;        // System + Mic together as one more track
@@ -62,7 +64,7 @@ sealed class Settings
 
     public Options ToOptions(string outOverride) => new(Fps, Qp, 20, SegmentMinutes * 60, 0,
         Path.GetFullPath(outOverride ?? OutDir), SystemAudio, Mic, Hidden: true, AudioShiftMs,
-        new Source(SystemDevice, SystemChannels, SystemVolume), new Source(MicDevice, MicChannels, MicVolume),
+        new Source(SystemDevice, SystemChannels, SystemVolume, SystemBackup), new Source(MicDevice, MicChannels, MicVolume, MicBackup),
         MixTrack, MixChannels, FirstTrack);
 
     public Settings Clone() => (Settings)MemberwiseClone();

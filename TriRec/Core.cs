@@ -15,8 +15,9 @@ namespace TriRec;
 record Mon(int Idx, int W, int H, int X, int Y);
 
 // One sound source. Device: endpoint id, null = the Windows default (followed when it changes).
+// Backup: used while Device is not connected; the Windows default is the last resort.
 // Channels: 1 or 2, Windows converts. Volume: percent, applied to the source's own track and to the Mix.
-record Source(string Device = null, int Channels = 2, int Volume = 100);
+record Source(string Device = null, int Channels = 2, int Volume = 100, string Backup = null);
 
 // AudioShiftMs: all sound is moved this much later (negative = earlier) against the picture. null = AutoShift(fps).
 // MixTrack: also write System + Mic together as one track (when both are recorded). FirstTrack: "Mix", "System"
@@ -233,10 +234,10 @@ static class Recorder
         {
             // A new pipe name for every recording: the tray app starts several in one process.
             var t = new AudioTap(loopback, title, $"trirec_{title.ToLowerInvariant()}_{Environment.ProcessId}_{Interlocked.Increment(ref pipeSerial)}",
-                                 src.Device, src.Channels);
+                                 src.Device, src.Channels, src.Backup);
             taps.Add(t);
             Log($"  audio {title}: {t.Rate} Hz, {t.Channels} ch, {t.Fmt}, volume {src.Volume}%, " +
-                (src.Device == null ? "Windows default device" : "chosen device") + $" ({AudioDevices.Name(t.DeviceId) ?? "?"})");
+                t.Which + $" ({AudioDevices.Name(t.DeviceId) ?? "?"})");
         }
         catch (Exception e)
         {
@@ -316,9 +317,11 @@ sealed class AudioTap
     readonly NamedPipeServerStream pipe;
     byte[] format;    // the WAVEFORMATEX this recording uses; every device after the first is asked for it too
     string deviceId;  // the device being captured, to notice when the Windows default changes
-    readonly string wantId; // the chosen device (null = Windows default)
+    readonly string wantId, backupId; // the chosen device and its backup (null = none; the Windows default comes last)
     readonly int wantChannels;
     public string DeviceId => deviceId;
+    // Which of the three is being captured, for the log.
+    public string Which => deviceId == wantId && wantId != null ? "chosen device" : deviceId == backupId && backupId != null ? "backup device" : "Windows default device";
 
     const int Loopback = 0x00020000, AutoConvert = unchecked((int)0x80000000) | 0x08000000; // AUTOCONVERTPCM | SRC_DEFAULT_QUALITY
     // Test hooks: TRIREC_TEST_RATE asks for another rate (proves Windows' conversion), TRIREC_TEST_SWITCH_SEC
@@ -326,9 +329,9 @@ sealed class AudioTap
     static readonly int TestRate = int.TryParse(Environment.GetEnvironmentVariable("TRIREC_TEST_RATE"), out int r) ? r : 48000;
     static readonly int TestSwitchSec = int.TryParse(Environment.GetEnvironmentVariable("TRIREC_TEST_SWITCH_SEC"), out int s) ? s : 0;
 
-    public AudioTap(bool loopback, string title, string pipeName, string device = null, int channels = 0)
+    public AudioTap(bool loopback, string title, string pipeName, string device = null, int channels = 0, string backup = null)
     {
-        this.loopback = loopback; Title = title; PipeName = pipeName; wantId = device;
+        this.loopback = loopback; Title = title; PipeName = pipeName; wantId = device; backupId = backup == device ? null : backup;
         wantChannels = channels is 1 or 2 ? channels : (loopback ? 2 : 1);
         Open(first: true);
         // ~100 ms of pipe buffer: small, so little stale audio sits in it while ffmpeg starts up
@@ -355,7 +358,8 @@ sealed class AudioTap
         if (first)
         {
             format = Wave(TestRate, wantChannels);
-            if (wantId != null && id != wantId) Recorder.Log($"  audio {Title}: the chosen device is not connected; using the Windows default until it is");
+            if (wantId != null && id != wantId)
+                Recorder.Log($"  audio {Title}: the chosen device is not connected; using the {(id == backupId ? "backup" : "Windows default")} until it is");
             c = Activate(dev);
             if (!TryInit(c, flags | AutoConvert, format))
             {
@@ -383,18 +387,19 @@ sealed class AudioTap
         client = c; cap = (IAudioCaptureClient)co; deviceId = id;
     }
 
-    // The device to capture: the chosen one if it is connected, otherwise the Windows default.
+    // The device to capture: the chosen one if it is connected, else the backup, else the Windows default.
     IMMDevice Target(out string id)
     {
         var en = (IMMDeviceEnumerator)new MMDeviceEnumerator(); // a fresh one on the calling thread
-        if (wantId != null)
-            try
-            {
-                en.GetDevice(wantId, out var d);
-                d.GetState(out int state);
-                if (state == 1) { id = wantId; return d; } // DEVICE_STATE_ACTIVE
-            }
-            catch { } // unknown id: fall through to the default
+        foreach (var want in new[] { wantId, backupId })
+            if (want != null)
+                try
+                {
+                    en.GetDevice(want, out var d);
+                    d.GetState(out int state);
+                    if (state == 1) { id = want; return d; } // DEVICE_STATE_ACTIVE
+                }
+                catch { } // unknown id: try the next
         en.GetDefaultAudioEndpoint(loopback ? 0 : 1, 0, out var dev);
         id = AudioDevices.Id(dev);
         return dev;
@@ -449,7 +454,7 @@ sealed class AudioTap
     }
 
     // True when a different device should be captured now: the Windows default changed (following the default),
-    // or the chosen device came back (after falling back to the default).
+    // or a device higher in the order (chosen, backup) came back.
     bool DefaultChanged()
     {
         try { Target(out string id); return id != deviceId; }
