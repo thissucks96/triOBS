@@ -4,6 +4,7 @@
 //          [--seconds N] [--no-audio] [--no-mic]
 //   trirec crop FILE MONITOR [--qp 24]
 //   trirec devices
+//   trirec cleanup DIR [--gb N] [--days N] [--include-marked] [--delete]   (without --delete: only list)
 using System.Diagnostics;
 using System.Text.Json;
 
@@ -16,6 +17,7 @@ static class Program
         try
         {
             if (args.Length > 0 && args[0] == "devices") return Devices();
+            if (args.Length > 0 && args[0] == "cleanup") return Cleanup(args);
             return args.Length > 0 && args[0] == "crop" ? Crop(args) : Record(args);
         }
         catch (Exception e)
@@ -56,6 +58,23 @@ static class Program
                 Console.WriteLine($"  {(d.Id == def ? "*" : " ")} {d.Name}\n      {d.Id}");
         }
         Console.WriteLine("(* = Windows default)");
+        return 0;
+    }
+
+    // trirec cleanup: the storage limit by hand. Lists what would be deleted; --delete really deletes.
+    static int Cleanup(string[] args)
+    {
+        if (args.Length < 2) throw new Exception("usage: trirec cleanup DIR [--gb N] [--days N] [--include-marked] [--delete]");
+        string dir = Path.GetFullPath(args[1]);
+        int gb = Options.Int(args, "--gb", 0), days = Options.Int(args, "--days", 0);
+        bool keep = !args.Contains("--include-marked"), really = args.Contains("--delete");
+        var r = really ? Retention.Run(dir, days, gb, keep, Console.WriteLine) : Retention.Plan(dir, days, gb, keep, DateTime.Now);
+        Console.WriteLine($"{r.Files} recordings, {Retention.Size(r.Bytes)}; {r.Marked} marked ({Retention.Size(r.MarkedBytes)})");
+        if (!really)
+        {
+            foreach (var (f, why) in r.Delete) Console.WriteLine($"  would delete {f.Name}  {Retention.Size(f.Length)}  ({why})");
+            Console.WriteLine($"{r.Delete.Count} would be deleted, {Retention.Size(r.AfterBytes)} would be left. Add --delete to do it.");
+        }
         return 0;
     }
 

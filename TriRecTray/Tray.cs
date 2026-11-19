@@ -10,6 +10,7 @@
 //   TriRecTray --start-recording ask the running tray app to start recording
 //   TriRecTray --exit            ask the running tray app to stop and exit (--stop is the old name)
 //   TriRecTray --settings        ask the running tray app to open its settings window
+//   TriRecTray --stopped         open in the tray without starting to record
 //   TriRecTray --mark            mark this moment (same as Ctrl+Alt+M): appends to <file>.marks.txt
 //
 // Messages go to trirec.log in the recordings folder.
@@ -42,6 +43,10 @@ sealed class Settings
     public int MixChannels { get; set; } = 1;
     public string FirstTrack { get; set; } = "Mix";   // written first and played by default
     public bool RecordOnLaunch { get; set; } = true;  // false: opening TriRec leaves it stopped in the tray
+    // Storage limit (Retention.cs): TriRec's own oldest recordings are deleted past these. 0 = no limit.
+    public int KeepGb { get; set; }
+    public int KeepDays { get; set; }
+    public bool KeepMarked { get; set; } = true;      // a recording with marks (Ctrl+Alt+M) is never deleted
     // Sound moved this many ms later (negative = earlier). Leave out (null) for the measured automatic value.
     public int? AudioShiftMs { get; set; }
 
@@ -206,8 +211,13 @@ static class Tray
         icon.ContextMenuStrip = menu;
         icon.DoubleClick += (_, _) => ShowSettings();
 
-        if (settings.RecordOnLaunch) StartRecording();
-        else { paused = true; opts = settings.ToOptions(outOverride); Recorder.Log("TriRec opened; recording not started (setting)"); }
+        if (settings.RecordOnLaunch && !args.Contains("--stopped")) StartRecording();
+        else
+        {
+            paused = true; opts = settings.ToOptions(outOverride);
+            Recorder.Log("TriRec opened; recording not started (" + (args.Contains("--stopped") ? "--stopped" : "setting") + ")");
+            Cleanup();
+        }
         if (args.Contains("--settings")) ShowSettings();
 
         // UI-thread timer: keeps the tooltip current, notices ffmpeg dying, and listens for --stop / --settings.
@@ -240,6 +250,7 @@ static class Tray
                 else { died = true; Recorder.Log($"trying again in {ScheduleRetry()} s"); }
             }
             icon.Text = "TriRec: " + State();
+            if (session != null && !died && ++cleanTicks >= 600) { cleanTicks = 0; Cleanup(); } // every 10 min while recording
         };
         timer.Start();
 
@@ -278,6 +289,21 @@ static class Tray
     }
 
     // Stop recording but stay in the tray, like OBS. Also cancels a pending automatic restart.
+    // Apply the storage limit, off the UI thread; one run at a time.
+    static int cleaning, cleanTicks;
+    static void Cleanup()
+    {
+        var s = settings; string dir = opts.OutDir;
+        if (s.KeepGb <= 0 && s.KeepDays <= 0) return;
+        if (Interlocked.Exchange(ref cleaning, 1) == 1) return;
+        Task.Run(() =>
+        {
+            try { Retention.Run(dir, s.KeepDays, s.KeepGb, s.KeepMarked, Recorder.Log); }
+            catch (Exception e) { Recorder.Log("storage: " + e.Message); }
+            finally { cleaning = 0; }
+        });
+    }
+
     static void Pause()
     {
         Cursor.Current = Cursors.WaitCursor;
@@ -323,6 +349,7 @@ static class Tray
             Directory.CreateDirectory(opts.OutDir);
             session = Recorder.Start(opts);
             icon.Icon = red;
+            Cleanup();
             return true;
         }
         catch (Exception e)
@@ -354,7 +381,7 @@ static class Tray
             form = null;
             if (!f.Saved) return;
             settings = Persist(f);
-            if (paused) { opts = settings.ToOptions(outOverride); return; } // stopped: keep it stopped, use the new settings next time
+            if (paused) { opts = settings.ToOptions(outOverride); Cleanup(); return; } // stopped: keep it stopped, use the new settings next time
             Cursor.Current = Cursors.WaitCursor;
             StopRecording();
             StartRecording();

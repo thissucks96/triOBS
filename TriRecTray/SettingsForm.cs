@@ -1,4 +1,4 @@
-// The settings window: three tabs (Recording, Sound, Advanced) and a status line.
+// The settings window: tabs (Recording, Sound, Tracks, Storage, Advanced) and a status line.
 // Changes are kept in the window until Save; Tray applies them (and restarts a running recording).
 using System.Diagnostics;
 
@@ -185,6 +185,10 @@ sealed class SettingsForm : Form
     readonly Label plan = new() { AutoSize = true, Anchor = AnchorStyles.Left };
     readonly RadioButton syncAuto = new() { AutoSize = true }, syncManual = new() { Text = "Set by hand:", AutoSize = true };
     readonly NumericUpDown syncMs = new() { Minimum = -2000, Maximum = 2000, Increment = 10, Width = 72 };
+    readonly CheckBox gbOn = Ui.Check("Keep the folder under"), daysOn = Ui.Check("Delete recordings older than");
+    readonly CheckBox keepMarked = Ui.Check("Never delete a recording that has a mark (Ctrl+Alt+M)");
+    readonly NumericUpDown gb = new() { Minimum = 5, Maximum = 20000, Increment = 10, Width = 72 }, days = new() { Minimum = 1, Maximum = 365, Width = 64 };
+    readonly Label usage = new() { AutoSize = true, MaximumSize = new Size(470, 0) }, preview = new() { AutoSize = true, MaximumSize = new Size(470, 0) };
     readonly Label status = new() { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Ui.Gray };
     public readonly Button SaveButton = new() { Text = "Save", AutoSize = true, MinimumSize = new Size(96, 30) };
     readonly List<int> qps = new();
@@ -226,6 +230,9 @@ sealed class SettingsForm : Form
         mixCh.Items.AddRange(new object[] { "Stereo", "Mono" }); mixCh.SelectedIndex = s.MixChannels == 1 ? 1 : 0;
         syncAuto.Checked = s.AudioShiftMs == null; syncManual.Checked = !syncAuto.Checked;
         syncMs.Value = Math.Clamp(s.AudioShiftMs ?? Options.AutoShift(s.Fps), -2000, 2000);
+        gbOn.Checked = s.KeepGb > 0; gb.Value = Math.Clamp(s.KeepGb > 0 ? s.KeepGb : 200, 5, 20000);
+        daysOn.Checked = s.KeepDays > 0; days.Value = Math.Clamp(s.KeepDays > 0 ? s.KeepDays : 14, 1, 365);
+        keepMarked.Checked = s.KeepMarked;
 
         // ---- Recording tab
         var rec = new Page();
@@ -279,15 +286,32 @@ sealed class SettingsForm : Form
         syncManual.CheckedChanged += (_, _) => syncMs.Enabled = syncManual.Checked;
         Fps.ValueChanged += (_, _) => ShowAutoShift();
         ShowAutoShift();
-        adv.Section("Marking moments");
-        adv.Full(Ui.Hint("Press Ctrl+Alt+M while recording (or use the tray menu) to note the time. It is written to <file>.marks.txt next to the recording, e.g. \"00:12:34  (clock 10:54:19)\"."));
         adv.Section("Files TriRec uses");
         var openSettings = Ui.Button("Open");
         openSettings.Click += (_, _) => { if (File.Exists(Settings.FilePath)) Process.Start(new ProcessStartInfo("notepad.exe", $"\"{Settings.FilePath}\"")); };
         adv.Row("Settings", Ui.Flow(new Label { Text = Settings.FilePath, AutoSize = true, ForeColor = Ui.Gray, MaximumSize = new Size(380, 0) }, openSettings));
         adv.Row("ffmpeg", new Label { Text = FindFfmpeg() ?? "Not found on PATH: recording will fail until ffmpeg is installed", AutoSize = true, ForeColor = Ui.Gray, MaximumSize = new Size(470, 0) });
 
-        foreach (var (name, page) in new[] { ("Recording", rec), ("Sound", snd), ("Tracks", trk), ("Advanced", adv) })
+        // ---- Storage tab
+        var sto = new Page();
+        sto.Section("Storage limit (rolling buffer)");
+        sto.Full(Ui.Hint("Off by default. When on, TriRec deletes its own oldest recordings so the folder does not fill the drive."));
+        sto.Full(Ui.Flow(gbOn, gb, Ui.Hint("GB   (oldest recordings are deleted first)")));
+        sto.Full(Ui.Flow(daysOn, days, Ui.Hint("days")));
+        sto.Full(keepMarked);
+        sto.Full(Ui.Hint("Only TriRec's own recordings (named like 2026-11-17_10-54-44.mkv) are deleted, permanently, not to the Recycle Bin. " +
+                    "Other files and folders are never touched, nor the file being recorded. Checked when recording starts and every 10 minutes."));
+        sto.Row("Folder now", usage);
+        sto.Row("These limits", preview);
+        sto.Section("Marking moments");
+        sto.Full(Ui.Hint("Press Ctrl+Alt+M while recording (or use the tray menu) to note the time. It is written to <file>.marks.txt next to the recording, " +
+                         "e.g. \"00:12:34  (clock 10:54:19)\". With the box above ticked, a marked recording is kept for good."));
+        foreach (var c in new Control[] { gbOn, daysOn, keepMarked }) ((CheckBox)c).CheckedChanged += (_, _) => UpdateStorage();
+        gb.ValueChanged += (_, _) => UpdateStorage(); days.ValueChanged += (_, _) => UpdateStorage();
+        folder.Leave += (_, _) => UpdateStorage();
+        UpdateStorage();
+
+        foreach (var (name, page) in new[] { ("Recording", rec), ("Sound", snd), ("Tracks", trk), ("Storage", sto), ("Advanced", adv) })
         {
             var tp = new TabPage(name) { UseVisualStyleBackColor = true };
             tp.Controls.Add(page.T);
@@ -339,6 +363,24 @@ sealed class SettingsForm : Form
         syncAuto.Text = $"Automatic: at {Fps.Value} fps, sound is moved {Math.Abs(ms)} ms {(ms < 0 ? "earlier" : "later")}";
     }
 
+    // "Folder now" and what the chosen limits would delete if applied this minute.
+    void UpdateStorage()
+    {
+        gb.Enabled = gbOn.Checked; days.Enabled = daysOn.Checked;
+        string dir;
+        try { dir = Path.GetFullPath(folder.Text.Trim()); } catch { usage.Text = preview.Text = "(folder name not valid)"; return; }
+        var now = Retention.Plan(dir, 0, 0, true, DateTime.Now);
+        string free = "";
+        try { free = $"; {Retention.Size(new DriveInfo(Path.GetPathRoot(dir)).AvailableFreeSpace)} free on {Path.GetPathRoot(dir).TrimEnd('\\')}"; } catch { }
+        usage.Text = $"{now.Files} recordings, {Retention.Size(now.Bytes)}" + (now.Marked > 0 ? $" ({now.Marked} marked, {Retention.Size(now.MarkedBytes)})" : "") + free;
+        if (!gbOn.Checked && !daysOn.Checked) { preview.Text = "Nothing is deleted (no limit set)."; return; }
+        var p = Retention.Plan(dir, daysOn.Checked ? (int)days.Value : 0, gbOn.Checked ? (int)gb.Value : 0, keepMarked.Checked, DateTime.Now);
+        preview.Text = p.Delete.Count == 0 ? "Would delete nothing right now."
+            : $"Would delete {p.Delete.Count} recording{(p.Delete.Count == 1 ? "" : "s")} now ({Retention.Size(p.Delete.Sum(d => d.File.Length))}), " +
+              $"oldest {p.Delete[0].File.Name}; {Retention.Size(p.AfterBytes)} left.";
+        if (gbOn.Checked && p.AfterBytes > (long)gb.Value << 30) preview.Text += " Still over the limit: the rest is marked or being recorded.";
+    }
+
     bool updating;
 
     // Rebuild the "Track 1" choices and the track list from the current sound settings.
@@ -376,6 +418,7 @@ sealed class SettingsForm : Form
         r.MixTrack = mixOn.Checked; r.MixChannels = mixCh.SelectedIndex == 1 ? 1 : 2; r.FirstTrack = first.SelectedItem as string ?? "Mix";
         r.RecordOnLaunch = recordOnLaunch.Checked;
         r.AudioShiftMs = syncManual.Checked ? (int)syncMs.Value : null;
+        r.KeepGb = gbOn.Checked ? (int)gb.Value : 0; r.KeepDays = daysOn.Checked ? (int)days.Value : 0; r.KeepMarked = keepMarked.Checked;
         SavedSettings = r; SavedAutoStart = auto.Checked; // capture now: the controls are gone once the window closes
         Saved = true;
         Close();

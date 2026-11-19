@@ -95,6 +95,20 @@ Open, not fixed (each is new behaviour, the owner decides):
 - Test: `test\backup-device-test.ps1 -Main ... -Backup ...` (a made-up id stands in for an unplugged device). 7/7.
 - NOT tested: really unplugging the Focusrite mid-recording and plugging it back in.
 
+## Storage limit / rolling buffer (2026-11-19)
+- Settings, Storage tab: keep the folder under N GB and/or delete recordings older than N days; a recording with
+  marks (Ctrl+Alt+M) is never deleted unless that box is cleared. Off by default (`KeepGb`, `KeepDays` = 0).
+- Only TriRec's own files (`2026-11-17_10-54-44.mkv`, directly in the folder) are deleted, permanently. Crops,
+  other files, subfolders, the newest file and anything written in the last 2 minutes are never touched.
+- Applied when TriRec opens, when recording starts, every 10 minutes while recording, and after saving settings.
+  Each deletion is a line in trirec.log. Code: `TriRec\Retention.cs`.
+- The tab shows the folder size and what the chosen limits would delete right now (preview only).
+- `trirec cleanup DIR --gb N --days N [--include-marked]` lists; add `--delete` to do it.
+- New switch: `TriRecTray --stopped` opens in the tray without recording.
+- Test: `test\storage-test.ps1` (sparse fake files, no disk use). 10/10.
+- NOT tested: the 10-minute check during a real recording; turning it on from the window and pressing Save.
+- Measured: 24 recordings, 14.9 GB after about two days of part-time recording (the owner's folder).
+
 ## 3. Never tested
 - Clicking the tray menu and how the icon looks (stop/start/exit were tested with the switches).
 - Saving settings while recording is stopped.

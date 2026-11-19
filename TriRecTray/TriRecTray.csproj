@@ -17,5 +17,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\TriRec\Core.cs" Link="Core.cs" />
+    <Compile Include="..\TriRec\Retention.cs" Link="Retention.cs" />
   </ItemGroup>
 </Project>
