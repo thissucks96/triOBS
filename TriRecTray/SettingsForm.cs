@@ -295,7 +295,7 @@ sealed class SettingsForm : Form
         // ---- Storage tab
         var sto = new Page();
         sto.Section("Storage limit (rolling buffer)");
-        sto.Full(Ui.Hint("Off by default. When on, TriRec deletes its own oldest recordings so the folder does not fill the drive."));
+        sto.Full(Ui.Hint("TriRec deletes its own oldest recordings so the folder does not fill the drive. On by default at 200 GB; clear both boxes to keep everything."));
         sto.Full(Ui.Flow(gbOn, gb, Ui.Hint("GB   (oldest recordings are deleted first)")));
         sto.Full(Ui.Flow(daysOn, days, Ui.Hint("days")));
         sto.Full(keepMarked);

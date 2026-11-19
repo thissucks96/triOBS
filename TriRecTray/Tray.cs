@@ -44,7 +44,8 @@ sealed class Settings
     public string FirstTrack { get; set; } = "Mix";   // written first and played by default
     public bool RecordOnLaunch { get; set; } = true;  // false: opening TriRec leaves it stopped in the tray
     // Storage limit (Retention.cs): TriRec's own oldest recordings are deleted past these. 0 = no limit.
-    public int KeepGb { get; set; }
+    // 200 GB is on by default (also for settings files saved before this existed); 0 in the file turns it off.
+    public int KeepGb { get; set; } = 200;
     public int KeepDays { get; set; }
     public bool KeepMarked { get; set; } = true;      // a recording with marks (Ctrl+Alt+M) is never deleted
     // Sound moved this many ms later (negative = earlier). Leave out (null) for the measured automatic value.

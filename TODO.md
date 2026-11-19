@@ -97,7 +97,8 @@ Open, not fixed (each is new behaviour, the owner decides):
 
 ## Storage limit / rolling buffer (2026-11-19)
 - Settings, Storage tab: keep the folder under N GB and/or delete recordings older than N days; a recording with
-  marks (Ctrl+Alt+M) is never deleted unless that box is cleared. Off by default (`KeepGb`, `KeepDays` = 0).
+  marks (Ctrl+Alt+M) is never deleted unless that box is cleared. On by default at 200 GB (`KeepGb` = 200, also for
+  settings files saved before; `KeepGb` = 0 turns it off). `KeepDays` off by default.
 - Only TriRec's own files (`2026-11-17_10-54-44.mkv`, directly in the folder) are deleted, permanently. Crops,
   other files, subfolders, the newest file and anything written in the last 2 minutes are never touched.
 - Applied when TriRec opens, when recording starts, every 10 minutes while recording, and after saving settings.
