@@ -76,6 +76,28 @@ sealed class Settings
     public Settings Clone() => (Settings)MemberwiseClone();
 }
 
+// Which desktop gets the input: "Default" normally; the lock screen, Ctrl+Alt+Del and UAC prompts use a secure one
+// that this program cannot open (and screen capture cannot see).
+static class Desktop
+{
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr OpenInputDesktop(int flags, bool inherit, uint access);
+    [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetUserObjectInformation(IntPtr h, int index, char[] buf, int len, out int needed);
+
+    public static bool IsDefault()
+    {
+        var h = OpenInputDesktop(0, false, 0x0001); // DESKTOP_READOBJECTS
+        if (h == IntPtr.Zero) return false;
+        try
+        {
+            var buf = new char[64];
+            if (!GetUserObjectInformation(h, 2, buf, buf.Length * 2, out _)) return true; // UOI_NAME; unknown: do not block
+            return new string(buf).TrimEnd('\0').Equals("Default", StringComparison.OrdinalIgnoreCase);
+        }
+        finally { CloseDesktop(h); }
+    }
+}
+
 // "Start with Windows" = TriRec.lnk in the current user's Startup folder, pointing at this exe.
 // Every build is written to the same app folder, so the shortcut keeps opening the newest version.
 // Only touched when the box is changed.
@@ -151,6 +173,7 @@ static class Tray
     static bool died;      // the recorder ended by itself and a restart is pending
     static int failures;   // restarts in a row that did not last
     static long retryAt;
+    static bool lastAccessLost, waitingDesktop;
     static NotifyIcon icon;
     static Icon red, gray;
     static SettingsForm form;
@@ -232,23 +255,37 @@ static class Tray
             if (markEvent.WaitOne(0)) Mark();
             if (session != null && !died && session.Ff.HasExited)
             {
-                // The recorder ended by itself: start it again, waiting longer each time it keeps failing
-                // (10 s, 20 s, 40 s ... up to 5 min) so a lasting fault does not spin.
+                // The recorder ended by itself. If it had been running fine (30 s or more) this is a one-off,
+                // usually Windows taking the screens away for a moment: start again at once, quietly.
+                // If it keeps failing, wait longer each time (10 s, 20 s, 40 s ... up to 5 min) so it does not spin;
+                // after Windows interruptions the first three tries are 2 s apart.
                 died = true;
                 session.Wall.Stop();
                 icon.Icon = gray;
-                if (session.Wall.Elapsed.TotalMinutes >= 2) failures = 0; // it had been running fine
-                int wait = ScheduleRetry();
-                Recorder.Log($"ffmpeg exited by itself with code {session.Ff.ExitCode}; starting again in {wait} s");
-                icon.ShowBalloonTip(10000, "TriRec stopped recording",
-                    $"The recorder ended by itself (code {session.Ff.ExitCode}). Starting again in {wait} seconds.", ToolTipIcon.Warning);
+                lastAccessLost = session.AccessLost;
+                bool ranFine = session.Wall.Elapsed.TotalSeconds >= 30;
+                int wait;
+                if (ranFine) { failures = 0; wait = 1; retryAt = Environment.TickCount64 + 1000; }
+                else { Recorder.ForgetMonitors(); wait = ScheduleRetry(); } // measure the monitors again in case they changed
+                Recorder.Log((session.AccessLost ? "Windows interrupted screen capture (lock screen, UAC prompt, display change or fullscreen game)"
+                                                 : $"ffmpeg exited by itself with code {session.Ff.ExitCode}") + $"; starting again in {wait} s");
+                if (!ranFine && !session.AccessLost)
+                    icon.ShowBalloonTip(10000, "TriRec stopped recording",
+                        $"The recorder ended by itself (code {session.Ff.ExitCode}). Starting again in {wait} seconds.", ToolTipIcon.Warning);
             }
             else if (died && form == null && Environment.TickCount64 >= retryAt)
             {
-                session?.Stop(0); // already exited; this releases the sound devices
-                session = null;
-                if (StartRecording(quiet: true)) Recorder.Log("recording restarted");
-                else { died = true; Recorder.Log($"trying again in {ScheduleRetry()} s"); }
+                // Screen capture cannot work while the lock screen or a UAC prompt is showing: wait for the desktop.
+                if (!Desktop.IsDefault()) { if (!waitingDesktop) Recorder.Log("waiting: the screen is locked or a secure prompt is showing"); waitingDesktop = true; }
+                else
+                {
+                    if (waitingDesktop) Recorder.Log("desktop is back");
+                    waitingDesktop = false;
+                    session?.Stop(0); // already exited; this releases the sound devices
+                    session = null;
+                    if (StartRecording(quiet: true)) Recorder.Log("recording restarted");
+                    else { died = true; Recorder.Log($"trying again in {ScheduleRetry()} s"); }
+                }
             }
             icon.Text = "TriRec: " + State();
             if (session != null && !died && ++cleanTicks >= 600) { cleanTicks = 0; Cleanup(); } // every 10 min while recording
@@ -326,7 +363,7 @@ static class Tray
     static string State()
     {
         if (paused) return "Stopped (right-click, Start recording)";
-        if (died) return "Recording stopped; starting again shortly";
+        if (died) return waitingDesktop ? "Waiting for the desktop (locked or UAC prompt)" : "Recording stopped; starting again shortly";
         if (session == null) return "Not recording (check Settings)";
         var t = session.Wall.Elapsed;
         return $"Recording for {(int)t.TotalHours}h {t.Minutes:00}m";
@@ -334,7 +371,8 @@ static class Tray
 
     static int ScheduleRetry()
     {
-        int wait = Math.Min(300, 10 << Math.Min(failures++, 5));
+        int wait = lastAccessLost && failures < 3 ? 2 : Math.Min(300, 10 << Math.Min(failures, 5));
+        failures++;
         retryAt = Environment.TickCount64 + wait * 1000L;
         return wait;
     }

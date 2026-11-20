@@ -81,6 +81,9 @@ sealed class Session
     internal long VideoStart;
     // Sync correction in Stopwatch ticks: the audio timeline starts this much before VideoStart (negative = after).
     internal long ShiftTicks;
+    // ffmpeg reported DXGI_ERROR_ACCESS_LOST: Windows took the screens away (lock screen, UAC prompt, display
+    // change, fullscreen game). Not a fault of the recording; the tray app restarts at once.
+    public volatile bool AccessLost;
 
     // Ask ffmpeg to finish the current file properly ("q" on its stdin).
     public void RequestStop()
@@ -202,6 +205,7 @@ static class Recorder
         {
             string line = e.Data;
             if (string.IsNullOrWhiteSpace(line)) return;
+            if (line.Contains("887a0026")) session.AccessLost = true;
             if (line.Contains("Set first pts to"))
             {
                 stampSum += Stopwatch.GetTimestamp();
@@ -245,18 +249,30 @@ static class Recorder
         }
     }
 
-    // Ask ffmpeg which Desktop Duplication outputs exist and how big they are.
+    // Which Desktop Duplication outputs exist and how big they are, as ffmpeg sees them. Asking ffmpeg costs about
+    // 3 s per monitor, so all are asked at once, and the answer is kept for later recordings in this process while
+    // Windows' monitor list (names, positions, sizes) stays the same. A new process always measures.
+    static (string Sig, List<(int idx, int w, int h)> List) probed;
+    public static void ForgetMonitors() => probed = default;
+
     static List<(int idx, int w, int h)> Probe()
     {
-        var list = new List<(int, int, int)>();
-        for (int i = 0; i < 8; i++)
+        string sig = Screens.Signature(out int count);
+        var keep = probed;
+        if (sig != null && keep.Sig == sig) { Log("  monitors: same as before, not measured again"); return keep.List; }
+        var sw = Stopwatch.StartNew();
+        int n = Math.Clamp(count + 1, 2, 8); // one more than Windows lists, so a missed one still shows up
+        var found = new (int, int, int)?[n];
+        Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = n }, i =>
         {
             string err = RunCapture("ffmpeg", $"-hide_banner -f lavfi -i ddagrab=output_idx={i}:framerate=1 -frames:v 1 -f null -");
             var m = Regex.Match(err, @"wrapped_avframe, d3d11, (\d+)x(\d+)");
-            if (!m.Success) break;
-            list.Add((i, int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value)));
-        }
+            if (m.Success) found[i] = (i, int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value));
+        });
+        var list = found.TakeWhile(x => x != null).Select(x => x.Value).ToList(); // ddagrab numbers outputs 0, 1, 2 ...
         if (list.Count == 0) throw new Exception("ffmpeg could not capture any monitor (is ffmpeg on PATH?)");
+        Log($"  monitors: measured in {sw.Elapsed.TotalSeconds:F1} s");
+        probed = (sig, list);
         return list;
     }
 
@@ -297,6 +313,39 @@ static class Recorder
         string err = p.StandardError.ReadToEnd();
         p.WaitForExit();
         return err;
+    }
+}
+
+// Windows' own monitor list, to notice a change (resolution, arrangement, monitor added or removed).
+static class Screens
+{
+    delegate bool EnumProc(IntPtr mon, IntPtr hdc, IntPtr rect, IntPtr data);
+    [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, EnumProc proc, IntPtr data);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfo(IntPtr mon, ref Info info);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct Info
+    {
+        public int Size, L, T, R, B, WL, WT, WR, WB, Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Device;
+    }
+
+    // e.g. "\\.\DISPLAY1 0,0,3840,2160|..." (null if Windows would not say)
+    public static string Signature(out int count)
+    {
+        var parts = new List<string>();
+        try
+        {
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (m, _, _, _) =>
+            {
+                var i = new Info { Size = Marshal.SizeOf<Info>() };
+                if (GetMonitorInfo(m, ref i)) parts.Add($"{i.Device} {i.L},{i.T},{i.R},{i.B}");
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+        count = parts.Count;
+        parts.Sort(StringComparer.Ordinal);
+        return parts.Count == 0 ? null : string.Join("|", parts);
     }
 }
 
