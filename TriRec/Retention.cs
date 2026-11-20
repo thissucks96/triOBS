@@ -12,7 +12,7 @@ namespace TriRec;
 static class Retention
 {
     const long GB = 1L << 30;
-    static readonly Regex OwnName = new(@"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.mkv$", RegexOptions.IgnoreCase);
+    internal static readonly Regex OwnName = new(@"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.mkv$", RegexOptions.IgnoreCase);
 
     public sealed class Report
     {

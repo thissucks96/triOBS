@@ -188,6 +188,8 @@ sealed class SettingsForm : Form
     readonly CheckBox gbOn = Ui.Check("Keep the folder under"), daysOn = Ui.Check("Delete recordings older than");
     readonly CheckBox keepMarked = Ui.Check("Never delete a recording that has a mark (Ctrl+Alt+M)");
     readonly NumericUpDown gb = new() { Minimum = 5, Maximum = 20000, Increment = 10, Width = 72 }, days = new() { Minimum = 1, Maximum = 365, Width = 64 };
+    readonly NumericUpDown clipSecs = new() { Minimum = 10, Maximum = 1800, Increment = 10, Width = 72 };
+    readonly TextBox clipFolder = new() { Width = 300, PlaceholderText = "Clips, inside the recordings folder" };
     readonly Label usage = new() { AutoSize = true, MaximumSize = new Size(470, 0) }, preview = new() { AutoSize = true, MaximumSize = new Size(470, 0) };
     readonly Label status = new() { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Ui.Gray };
     public readonly Button SaveButton = new() { Text = "Save", AutoSize = true, MinimumSize = new Size(96, 30) };
@@ -233,6 +235,7 @@ sealed class SettingsForm : Form
         gbOn.Checked = s.KeepGb > 0; gb.Value = Math.Clamp(s.KeepGb > 0 ? s.KeepGb : 200, 5, 20000);
         daysOn.Checked = s.KeepDays > 0; days.Value = Math.Clamp(s.KeepDays > 0 ? s.KeepDays : 14, 1, 365);
         keepMarked.Checked = s.KeepMarked;
+        clipSecs.Value = Math.Clamp(s.ClipSeconds, 10, 1800); clipFolder.Text = s.ClipFolder ?? "";
 
         // ---- Recording tab
         var rec = new Page();
@@ -303,6 +306,19 @@ sealed class SettingsForm : Form
                     "Other files and folders are never touched, nor the file being recorded. Checked when recording starts and every 10 minutes."));
         sto.Row("Folder now", usage);
         sto.Row("These limits", preview);
+        sto.Section("Clips (Ctrl+Alt+S)");
+        sto.Row("Save the last", Ui.Flow(clipSecs, Ui.Hint("seconds")));
+        var clipBrowse = Ui.Button("Browse...");
+        clipBrowse.Click += (_, _) =>
+        {
+            using var d = new FolderBrowserDialog { SelectedPath = ClipDirNow(), Description = "Folder for clips", UseDescriptionForTitle = true };
+            if (d.ShowDialog(this) == DialogResult.OK) clipFolder.Text = d.SelectedPath;
+        };
+        var clipOpen = Ui.Button("Open");
+        clipOpen.Click += (_, _) => { var d = ClipDirNow(); Directory.CreateDirectory(d); Process.Start(new ProcessStartInfo(d) { UseShellExecute = true }); };
+        sto.Row("Clips folder", Ui.Flow(clipFolder, clipBrowse, clipOpen));
+        sto.Full(Ui.Hint("Ctrl+Alt+S (or the tray menu) copies the last seconds of the recording into a clip file within a second or two, " +
+                         "without re-encoding. It can start up to 20 s earlier (cuts begin on a keyframe). Clips are never deleted by the storage limit."));
         sto.Section("Marking moments");
         sto.Full(Ui.Hint("Press Ctrl+Alt+M while recording (or use the tray menu) to note the time. It is written to <file>.marks.txt next to the recording, " +
                          "e.g. \"00:12:34  (clock 10:54:19)\". With the box above ticked, a marked recording is kept for good."));
@@ -363,6 +379,12 @@ sealed class SettingsForm : Form
         syncAuto.Text = $"Automatic: at {Fps.Value} fps, sound is moved {Math.Abs(ms)} ms {(ms < 0 ? "earlier" : "later")}";
     }
 
+    string ClipDirNow()
+    {
+        try { return clipFolder.Text.Trim() != "" ? Path.GetFullPath(clipFolder.Text.Trim()) : Path.Combine(Path.GetFullPath(folder.Text.Trim()), "Clips"); }
+        catch { return folder.Text; }
+    }
+
     // "Folder now" and what the chosen limits would delete if applied this minute.
     void UpdateStorage()
     {
@@ -419,6 +441,7 @@ sealed class SettingsForm : Form
         r.RecordOnLaunch = recordOnLaunch.Checked;
         r.AudioShiftMs = syncManual.Checked ? (int)syncMs.Value : null;
         r.KeepGb = gbOn.Checked ? (int)gb.Value : 0; r.KeepDays = daysOn.Checked ? (int)days.Value : 0; r.KeepMarked = keepMarked.Checked;
+        r.ClipSeconds = (int)clipSecs.Value; r.ClipFolder = clipFolder.Text.Trim() == "" ? null : Path.GetFullPath(clipFolder.Text.Trim());
         SavedSettings = r; SavedAutoStart = auto.Checked; // capture now: the controls are gone once the window closes
         Saved = true;
         Close();

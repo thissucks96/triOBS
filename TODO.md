@@ -110,6 +110,26 @@ Open, not fixed (each is new behaviour, the owner decides):
 - NOT tested: the 10-minute check during a real recording; turning it on from the window and pressing Save.
 - Measured: 24 recordings, 14.9 GB after about two days of part-time recording (the owner's folder).
 
+## Crash fix (2026-11-19)
+- Seen in real use (2026-11-17 17:33): ffmpeg died with 887a0026 (DXGI access lost: lock screen, UAC prompt,
+  display change, fullscreen game). Recovery took about 18 s (10 s wait + 8 s start-up).
+- Now: a recording that ran 30 s or more and then died restarts after 1 s, quietly (no warning balloon); while the
+  lock screen or a UAC prompt is up it waits for the desktop instead of failing and backing off. Repeated quick
+  failures still back off (2 s x3 after access lost, else 10 s, 20 s ... 5 min) and re-measure the monitors.
+- Start-up: monitors measured all at once (2.4 s) and reused for restarts while Windows' monitor list is unchanged.
+- Test: `test\crash-test.ps1` (kills ffmpeg). Start-up 3.9 s (was ~10), gap after a kill 2.4 s (was ~18). 9/9.
+- NOT tested: the real triggers (Win+L, a UAC prompt, a fullscreen game changing resolution).
+
+## Save clip (2026-11-19)
+- Ctrl+Alt+S / tray menu / `TriRecTray --clip` / `trirec clip DIR --seconds N`: the last 120 s (Storage tab) into
+  `<recordings>\Clips` (or a chosen folder), stream copy, no re-encode. Balloon; click it to show the file.
+- Joins the end of the previous file when the current one is younger than the clip (new file, restart).
+- Starts on a keyframe, so up to 20 s longer than asked. Waits 4 s before cutting: the file on disk trails real time
+  by about 3 s (measured 2.9-3.2 s with ffmpeg now writing every 1 s instead of 5 s; was 5.5 s).
+- Test: `test\clip-test.ps1` (live recording, 1-minute files, a real Ctrl+Alt+S keypress). 10/10.
+- NOT verified: that the exact moment of the keypress is in the clip (only the lag was measured, about +-1 s);
+  the Clips section of the Storage tab was not looked at (the screenshot caught a game in front).
+
 ## 3. Never tested
 - Clicking the tray menu and how the icon looks (stop/start/exit were tested with the switches).
 - Saving settings while recording is stopped.

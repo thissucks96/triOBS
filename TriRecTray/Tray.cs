@@ -11,6 +11,7 @@
 //   TriRecTray --exit            ask the running tray app to stop and exit (--stop is the old name)
 //   TriRecTray --settings        ask the running tray app to open its settings window
 //   TriRecTray --stopped         open in the tray without starting to record
+//   TriRecTray --clip            save the last 2 minutes (same as Ctrl+Alt+S)
 //   TriRecTray --mark            mark this moment (same as Ctrl+Alt+M): appends to <file>.marks.txt
 //
 // Messages go to trirec.log in the recordings folder.
@@ -48,6 +49,8 @@ sealed class Settings
     public int KeepGb { get; set; } = 200;
     public int KeepDays { get; set; }
     public bool KeepMarked { get; set; } = true;      // a recording with marks (Ctrl+Alt+M) is never deleted
+    public int ClipSeconds { get; set; } = 120;       // Ctrl+Alt+S saves this much
+    public string ClipFolder { get; set; }            // null = "Clips" inside the recordings folder (never deleted by the storage limit)
     // Sound moved this many ms later (negative = earlier). Leave out (null) for the measured automatic value.
     public int? AudioShiftMs { get; set; }
 
@@ -130,7 +133,7 @@ static class AutoStart
     }
 }
 
-// Global hotkey Ctrl+Alt+M (works while a game has focus). Ok is false if another program already owns it.
+// A global Ctrl+Alt+<key> hotkey (works while a game has focus). Ok is false if another program already owns it.
 sealed class Hotkey : NativeWindow, IDisposable
 {
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
@@ -139,12 +142,12 @@ sealed class Hotkey : NativeWindow, IDisposable
     readonly Action pressed;
     public readonly bool Ok;
 
-    public Hotkey(Action pressed)
+    public Hotkey(Keys key, string what, Action pressed)
     {
         this.pressed = pressed;
         CreateHandle(new CreateParams());
-        Ok = RegisterHotKey(Handle, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, (uint)Keys.M);
-        if (!Ok) Recorder.Log("Ctrl+Alt+M is taken by another program; use the tray menu to mark moments");
+        Ok = RegisterHotKey(Handle, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, (uint)key);
+        if (!Ok) Recorder.Log($"Ctrl+Alt+{key} is taken by another program; use the tray menu to {what}");
     }
 
     protected override void WndProc(ref Message m)
@@ -163,7 +166,7 @@ sealed class Hotkey : NativeWindow, IDisposable
 static class Tray
 {
     const string StopEventName = "TriRecTray.Stop", SettingsEventName = "TriRecTray.Settings", MutexName = "TriRecTray.SingleInstance",
-                 PauseEventName = "TriRecTray.StopRecording", ResumeEventName = "TriRecTray.StartRecording", MarkEventName = "TriRecTray.Mark";
+                 PauseEventName = "TriRecTray.StopRecording", ResumeEventName = "TriRecTray.StartRecording", MarkEventName = "TriRecTray.Mark", ClipEventName = "TriRecTray.Clip";
 
     static Settings settings;
     static Options opts;
@@ -186,6 +189,7 @@ static class Tray
         if (args.Contains("--stop-recording")) { Signal(PauseEventName); return; }
         if (args.Contains("--start-recording")) { Signal(ResumeEventName); return; }
         if (args.Contains("--mark")) { Signal(MarkEventName); return; }
+        if (args.Contains("--clip")) { Signal(ClipEventName); return; }
         if (args.Contains("--settings") && Signal(SettingsEventName)) return;
         // Same as ticking or clearing "Start with Windows" in Settings, without opening the window.
         if (args.Contains("--startup-on")) { AutoStart.Set(true); return; }
@@ -218,7 +222,9 @@ static class Tray
         using var pauseEvent = new EventWaitHandle(false, EventResetMode.AutoReset, PauseEventName);
         using var resumeEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ResumeEventName);
         using var markEvent = new EventWaitHandle(false, EventResetMode.AutoReset, MarkEventName);
-        using var hotkey = new Hotkey(Mark);
+        using var clipEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ClipEventName);
+        using var hotkey = new Hotkey(Keys.M, "mark moments", Mark);
+        using var clipKey = new Hotkey(Keys.S, "save clips", Clip);
         icon = new NotifyIcon { Icon = gray, Text = "TriRec", Visible = true };
 
         var menu = new ContextMenuStrip();
@@ -226,12 +232,19 @@ static class Tray
         status.Enabled = false;
         var toggle = menu.Items.Add("Stop recording", null, (_, _) => { if (paused) Resume(); else Pause(); });
         menu.Items.Add(hotkey.Ok ? "Mark this moment (Ctrl+Alt+M)" : "Mark this moment", null, (_, _) => Mark());
+        var clipItem = menu.Items.Add("", null, (_, _) => Clip());
+        ui = SynchronizationContext.Current; // set up by the menu (a control): balloons from the clip thread go through it
+        icon.BalloonTipClicked += (_, _) => { if (lastClip != null && File.Exists(lastClip)) Process.Start("explorer.exe", $"/select,\"{lastClip}\""); };
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open recordings folder", null, (_, _) => Process.Start(new ProcessStartInfo(opts.OutDir) { UseShellExecute = true })); // works for folder names with spaces or commas
         menu.Items.Add("Settings...", null, (_, _) => ShowSettings());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => Application.Exit());
-        menu.Opening += (_, _) => { status.Text = State(); toggle.Text = paused ? "Start recording" : "Stop recording"; };
+        menu.Opening += (_, _) =>
+        {
+            status.Text = State(); toggle.Text = paused ? "Start recording" : "Stop recording";
+            clipItem.Text = $"Save the last {ClipLength(settings.ClipSeconds)}" + (clipKey.Ok ? " (Ctrl+Alt+S)" : "");
+        };
         icon.ContextMenuStrip = menu;
         icon.DoubleClick += (_, _) => ShowSettings();
 
@@ -253,6 +266,7 @@ static class Tray
             if (pauseEvent.WaitOne(0) && !paused) Pause();
             if (resumeEvent.WaitOne(0) && paused) Resume();
             if (markEvent.WaitOne(0)) Mark();
+            if (clipEvent.WaitOne(0)) Clip();
             if (session != null && !died && session.Ff.HasExited)
             {
                 // The recorder ended by itself. If it had been running fine (30 s or more) this is a one-off,
@@ -324,6 +338,29 @@ static class Tray
         catch (Exception e) { Recorder.Log("mark: could not write " + marks + ": " + e.Message); return; }
         Recorder.Log($"mark at {at:hh\\:mm\\:ss} in {file.Name}");
         icon.ShowBalloonTip(2000, "TriRec", $"Marked {(int)at.TotalHours:00}:{at:mm\\:ss} in {file.Name}", ToolTipIcon.None);
+    }
+
+    // Ctrl+Alt+S or the menu: save the last ClipSeconds as a clip (Clipper.cs), in the background.
+    static SynchronizationContext ui;
+    static string lastClip;
+    static int clipping;
+    public static string ClipLength(int s) => s % 60 == 0 ? $"{s / 60} min" : s < 60 ? $"{s} s" : $"{s / 60} min {s % 60} s";
+    static string ClipDir(Settings s, Options o) => string.IsNullOrWhiteSpace(s.ClipFolder) ? Path.Combine(o.OutDir, "Clips") : s.ClipFolder;
+
+    static void Clip()
+    {
+        if (session == null || paused || died) { icon.ShowBalloonTip(2000, "TriRec", "Not recording; nothing to save.", ToolTipIcon.None); return; }
+        if (Interlocked.Exchange(ref clipping, 1) == 1) return; // one at a time
+        var s = settings; var o = opts; var now = DateTime.Now;
+        Task.Run(() =>
+        {
+            string msg; string file = null;
+            try { file = Clipper.Save(o.OutDir, ClipDir(s, o), s.ClipSeconds, now, Recorder.Log); msg = $"Saved the last {ClipLength(s.ClipSeconds)}: {Path.GetFileName(file)}. Click to show it."; }
+            catch (Exception e) { Recorder.Log("clip: " + e.Message); msg = "Could not save the clip: " + e.Message; }
+            finally { clipping = 0; }
+            void Show(object _) { if (file != null) lastClip = file; icon.ShowBalloonTip(4000, "TriRec", msg, file != null ? ToolTipIcon.None : ToolTipIcon.Warning); }
+            if (ui != null) ui.Post(Show, null); else Show(null);
+        });
     }
 
     // Stop recording but stay in the tray, like OBS. Also cancels a pending automatic restart.

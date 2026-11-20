@@ -18,5 +18,6 @@
   <ItemGroup>
     <Compile Include="..\TriRec\Core.cs" Link="Core.cs" />
     <Compile Include="..\TriRec\Retention.cs" Link="Retention.cs" />
+    <Compile Include="..\TriRec\Clipper.cs" Link="Clipper.cs" />
   </ItemGroup>
 </Project>

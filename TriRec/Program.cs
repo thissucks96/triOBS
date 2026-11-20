@@ -4,6 +4,7 @@
 //          [--seconds N] [--no-audio] [--no-mic]
 //   trirec crop FILE MONITOR [--qp 24]
 //   trirec devices
+//   trirec clip DIR [--seconds 120] [--to DIR]   (the last N seconds, into DIR\Clips by default)
 //   trirec cleanup DIR [--gb N] [--days N] [--include-marked] [--delete]   (without --delete: only list)
 using System.Diagnostics;
 using System.Text.Json;
@@ -18,6 +19,8 @@ static class Program
         {
             if (args.Length > 0 && args[0] == "devices") return Devices();
             if (args.Length > 0 && args[0] == "cleanup") return Cleanup(args);
+            if (args.Length > 0 && args[0] == "clip") { Clipper.Save(Path.GetFullPath(args[1]), Path.GetFullPath(Options.Str(args, "--to", Path.Combine(args[1], "Clips"))),
+                                                                     Options.Int(args, "--seconds", 120), DateTime.Now, Console.WriteLine); return 0; }
             return args.Length > 0 && args[0] == "crop" ? Crop(args) : Record(args);
         }
         catch (Exception e)

@@ -188,7 +188,10 @@ static class Recorder
                      "-g", (o.Fps * o.Gop).ToString() }) a.Add(s);
         if (tracks.Count > 0) foreach (var s in new[] { "-c:a", "libopus", "-b:a", "96k" }) a.Add(s);
         if (o.Seconds > 0) { a.Add("-t"); a.Add(o.Seconds.ToString()); }
+        // cluster_time_limit: write to disk every second instead of every 5 s, so a clip (Ctrl+Alt+S) can include
+        // the moment the key was pressed.
         foreach (var s in new[] { "-f", "segment", "-segment_time", o.Segment.ToString(), "-segment_format", "matroska",
+                     "-segment_format_options", "cluster_time_limit=1000",
                      "-reset_timestamps", "1", "-strftime", "1",
                      Path.Combine(o.OutDir, "%Y-%m-%d_%H-%M-%S.mkv") }) a.Add(s);
 
